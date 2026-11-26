@@ -1,0 +1,24 @@
+name: dev-verify
+
+# 控制器专用的快速验证跑道：push 任意分支即跑 cargo test（nix develop 内）。
+# 与 ci.yml 的区别：不做 matrix/darwin，专注最快反馈。
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-test:
+    name: cargo test (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: cachix/cachix-action@v17
+        with:
+          name: samuka007
+          skipPush: true
+      - run: nix develop -c cargo build --workspace --bins
+      - run: nix develop -c cargo test --workspace
