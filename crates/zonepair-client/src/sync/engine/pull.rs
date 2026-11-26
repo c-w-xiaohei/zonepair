@@ -12,7 +12,7 @@ use crate::proto::cursor;
 use crate::transport::{StatusError, TransportFault};
 
 use crate::sync::persist::fs;
-use crate::sync::persist::state::{Materialized, Pull, SessionRecord};
+use crate::sync::persist::state::{Materialized, Pull, SessionRecord, State};
 use crate::sync::persist::time::now_rfc3339;
 
 use super::apply::{self, ChangesReply as ApplyReply, Outcome};
@@ -120,7 +120,7 @@ pub async fn run_pull(ctx: &ExecCtx, sid: &str, force_reset: bool) -> TaskOutcom
                             .get(sid)
                             .is_some_and(|r| r.pull_pending.is_some())
                     });
-                let commit = |st: &mut crate::sync::persist::state::State| {
+                let commit = |st: &mut State| {
                     let rec = st.sessions.entry(sid.to_string()).or_default();
                     if rec.deleted.is_some() {
                         return;
@@ -244,7 +244,7 @@ pub async fn run_pull(ctx: &ExecCtx, sid: &str, force_reset: bool) -> TaskOutcom
 /// §9 `sync --wait` contract that keeps the unchanged commit durable.
 fn commit_pull(ctx: &ExecCtx, sid: &str, next_cursor: &str, rel: &str, hydrate: bool) -> Result<()> {
     let durable = hydrate || would_satisfy(ctx, sid, next_cursor);
-    let commit = |st: &mut crate::sync::persist::state::State| {
+    let commit = |st: &mut State| {
         let rec = st.sessions.entry(sid.to_string()).or_default();
         if rec.deleted.is_some() {
             return; // tombstone committed mid-pull — never resurrect

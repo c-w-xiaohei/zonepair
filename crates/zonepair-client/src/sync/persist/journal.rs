@@ -18,9 +18,9 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::io;
 use std::io::Write;
-use std::time::Duration;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use super::fs::{ensure_dir, fsync_dir, open_new};
 use super::state::{self, Phase, PullPending, Registered, SessionRecord, State};
@@ -685,7 +685,7 @@ pub(crate) fn consume_ordered_parked(
 ) -> Result<Vec<Consumed>> {
     let (entries, _debris) = read_pending(dir)?;
     let mut out = Vec::with_capacity(entries.len());
-    let mut first_sighting = false;
+    let mut any_first_sighting = false;
     // Pass 1 — apply in consume order, collect. No commits, no deletes:
     // the batch commit below is the batch's single transaction, and any
     // first-sighting apply triggers it (spec §4.3: even one yielding
@@ -725,7 +725,7 @@ pub(crate) fn consume_ordered_parked(
                     None
                 };
                 let effect = apply(state, &intent, fp, &entry.name);
-                first_sighting = true;
+                any_first_sighting = true;
                 out.push(Consumed {
                     name: entry.name,
                     intent: Some(intent),
@@ -734,7 +734,7 @@ pub(crate) fn consume_ordered_parked(
             }
         }
     }
-    if !first_sighting {
+    if !any_first_sighting {
         // Pure parked re-emits (and unparseable debris) mutate nothing
         // and delete nothing — no commit at all (spec §4.3's
         // "非纯重放 apply" trigger read backwards).

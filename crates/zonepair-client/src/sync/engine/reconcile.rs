@@ -48,7 +48,7 @@
 //! reach the tombstone).
 
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -119,11 +119,11 @@ impl SessionStore for State {
 pub trait SessionReap: SessionStore {
     /// Delete the given sids' records in one commit; returns the sids
     /// actually removed. Implementations MUST re-validate the zombie
-    /// shape (`pull_pending` present, every other field absent) inside
-    /// the same lock hold as the removal — a record that picked up real
-    /// fields between the verdict and the commit (a concurrent journal
-    /// drain landing a register or task intent) is not a zombie anymore,
-    /// and deleting it would silently drop the resurrected intent.
+    /// shape (`state_machine::zombie_shape`) inside the same lock hold
+    /// as the removal — a record that picked up real fields between the
+    /// verdict and the commit (a concurrent journal drain landing a
+    /// register or task intent) is not a zombie anymore, and deleting it
+    /// would silently drop the resurrected intent.
     ///
     /// Honest limit of the guard: a fresh *pull* intent does NOT trip
     /// it — `merge_pull_pending` only rewrites `pull_pending` itself, so
@@ -136,21 +136,6 @@ pub trait SessionReap: SessionStore {
     /// revival-channel note already classifies as needing a mechanism of
     /// their own.
     fn reap_commit(&mut self, sync_dir: &Path, sids: &[String]) -> Result<Vec<String>>;
-}
-
-/// The zombie-shape re-validation `reap_commit` implementations share —
-/// deliberately the exact conjunct set of `state_machine`'s row 27 minus
-/// the probe inputs (file/B evidence cannot be re-taken inside the
-/// commit lock; the fields are the part that can race).
-fn reapable(rec: &SessionRecord) -> bool {
-    rec.pull_pending.is_some()
-        && rec.pull.is_none()
-        && rec.task.is_none()
-        && rec.published_at.is_none()
-        && rec.deleted.is_none()
-        && rec.registered.is_none()
-        && rec.materialized.is_none()
-        && rec.last_unchanged_at.is_none()
 }
 
 /// Production seam: the batch delete goes through `Shared::commit_state` —
@@ -168,7 +153,7 @@ impl SessionReap for Arc<Shared> {
                 // lock acquisition, and traffic landing mid-pass is the
                 // resurrection channel working as designed — never delete
                 // a record that stopped being a zombie.
-                if st.sessions.get(sid).is_some_and(reapable) {
+                if st.sessions.get(sid).is_some_and(state_machine::zombie_shape) {
                     st.sessions.remove(sid);
                     removed.push(sid.clone());
                 }
@@ -192,7 +177,7 @@ impl SessionReap for State {
     fn reap_commit(&mut self, sync_dir: &Path, sids: &[String]) -> Result<Vec<String>> {
         let mut removed = Vec::new();
         for sid in sids {
-            if self.sessions.get(sid).is_some_and(reapable) {
+            if self.sessions.get(sid).is_some_and(state_machine::zombie_shape) {
                 self.sessions.remove(sid);
                 removed.push(sid.clone());
             }
@@ -328,7 +313,7 @@ fn stat_probe(path: Option<PathBuf>) -> (FileProbe, Option<PathBuf>) {
             }
             _ => (FileProbe::absent(), Some(p)),
         },
-        _ => (FileProbe::absent(), path),
+        None => (FileProbe::absent(), None),
     }
 }
 
@@ -643,8 +628,7 @@ pub fn run<S: SessionReap>(
     }
 
     // ── phase 1: serial snapshot collection ─────────────────────────
-    let mut snapshots: std::collections::BTreeMap<String, Snapshot> =
-        std::collections::BTreeMap::new();
+    let mut snapshots: BTreeMap<String, Snapshot> = BTreeMap::new();
     let mut probe_targets: Vec<String> = Vec::new();
     for sid in &sids {
         let rec = store.get(sid);
@@ -1485,7 +1469,7 @@ mod tests {
         fn reap_commit(&mut self, _: &Path, sids: &[String]) -> Result<Vec<String>> {
             let mut removed = Vec::new();
             for sid in sids {
-                if self.state.sessions.get(sid).is_some_and(reapable) {
+                if self.state.sessions.get(sid).is_some_and(state_machine::zombie_shape) {
                     self.state.sessions.remove(sid);
                     removed.push(sid.clone());
                 }

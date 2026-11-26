@@ -376,6 +376,44 @@ mod tests {
         std::fs::remove_dir_all(&mirror).unwrap();
     }
 
+    /// The spec §4.6 "fake writer" fixture both lock-shape tests share:
+    /// a write hook that parks the FIRST physical write at a barrier and
+    /// never again. Returns the barrier releasing the parked write plus
+    /// the flag the hook flips as it enters. Deterministic by
+    /// construction: the candidates a test enqueues while the writer is
+    /// parked cannot be inside the in-flight write's serialization.
+    fn park_first_write(shared: &Shared) -> (Arc<Barrier>, Arc<AtomicBool>) {
+        let gate = Arc::new(Barrier::new(2));
+        let entered = Arc::new(AtomicBool::new(false));
+        let once = Arc::new(StdMutex::new(false));
+        let gate_hook = Arc::clone(&gate);
+        let entered_hook = Arc::clone(&entered);
+        let once_hook = Arc::clone(&once);
+        shared.set_lane_write_hook(Some(Arc::new(move || {
+            let mut fired = once_hook.lock().unwrap();
+            if !*fired {
+                *fired = true;
+                drop(fired);
+                entered_hook.store(true, AOrd::SeqCst);
+                gate_hook.wait();
+            }
+            Ok(())
+        })));
+        (gate, entered)
+    }
+
+    /// Spin briefly until the writer reaches the parked write — or fail
+    /// the test: everything below depends on the parking having taken.
+    fn wait_writer_parked(entered: &AtomicBool) {
+        for _ in 0..400 {
+            if entered.load(AOrd::SeqCst) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(entered.load(AOrd::SeqCst), "writer must reach the write");
+    }
+
     // Coalescing (spec §4.6's fake-writer test): the writer parked
     // inside its first write cannot serialize per-commit — the writes
     // that eventually happen must be FEWER than the commits issued.
@@ -387,24 +425,7 @@ mod tests {
         let (mirror, shared) = setup_shared("shared", "coalesce");
         let writes_before = shared.lane_write_count();
 
-        let gate = Arc::new(Barrier::new(2));
-        let entered = Arc::new(AtomicBool::new(false));
-        let once = Arc::new(StdMutex::new(false));
-        {
-            let gate_hook = Arc::clone(&gate);
-            let entered_hook = Arc::clone(&entered);
-            let once_hook = Arc::clone(&once);
-            shared.set_lane_write_hook(Some(Arc::new(move || {
-                let mut fired = once_hook.lock().unwrap();
-                if !*fired {
-                    *fired = true;
-                    drop(fired);
-                    entered_hook.store(true, AOrd::SeqCst);
-                    gate_hook.wait();
-                }
-                Ok(())
-            })));
-        }
+        let (gate, entered) = park_first_write(&shared);
         // Drive the writer into the parked write with one commit.
         let probe_shared = Arc::clone(&shared);
         let probe = std::thread::spawn(move || {
@@ -414,13 +435,7 @@ mod tests {
                 })
                 .unwrap();
         });
-        for _ in 0..400 {
-            if entered.load(AOrd::SeqCst) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(entered.load(AOrd::SeqCst), "writer must reach the write");
+        wait_writer_parked(&entered);
         // 30 lazy commits land while the writer is parked — none of
         // them can be inside the in-flight write's serialization.
         for i in 0..30 {
@@ -515,24 +530,7 @@ mod tests {
     #[test]
     fn readers_are_not_blocked_behind_write_io() {
         let (mirror, shared) = setup_shared("shared", "reader-free");
-        let release = Arc::new(Barrier::new(2));
-        let entered = Arc::new(AtomicBool::new(false));
-        let once = Arc::new(StdMutex::new(false));
-        {
-            let release_hook = Arc::clone(&release);
-            let entered_hook = Arc::clone(&entered);
-            let once_hook = Arc::clone(&once);
-            shared.set_lane_write_hook(Some(Arc::new(move || {
-                let mut fired = once_hook.lock().unwrap();
-                if !*fired {
-                    *fired = true;
-                    drop(fired);
-                    entered_hook.store(true, AOrd::SeqCst);
-                    release_hook.wait();
-                }
-                Ok(())
-            })));
-        }
+        let (release, entered) = park_first_write(&shared);
         let bg = Arc::clone(&shared);
         let writer_side = std::thread::spawn(move || {
             bg.commit_state(|st| {
@@ -540,13 +538,7 @@ mod tests {
             })
             .unwrap();
         });
-        for _ in 0..400 {
-            if entered.load(AOrd::SeqCst) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(entered.load(AOrd::SeqCst), "writer must reach the write");
+        wait_writer_parked(&entered);
         // The write is now parked mid-IO: the lock is provably not held
         // across it, or this read would block for the barrier's release.
         let seen = shared.with_state(|st| st.sessions.len());

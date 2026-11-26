@@ -743,17 +743,18 @@ impl Pool {
                     });
                     if owed {
                         let mut books = self.books.lock().unwrap();
-                        let pull_key = format!("pull:{sid}:false");
+                        let pull = Work::Pull {
+                            sid: sid.to_string(),
+                            force_reset: false,
+                        };
+                        let pull_key = pull.key();
                         if !books.map.contains_key(&pull_key) {
                             let next_at = Instant::now() + self.policy.pending_cooldown;
                             books.push_due(next_at, &pull_key);
                             books.map.insert(
                                 pull_key,
                                 Book {
-                                    work: Work::Pull {
-                                        sid: sid.to_string(),
-                                        force_reset: false,
-                                    },
+                                    work: pull,
                                     attempt: 0,
                                     next_at,
                                     deadline: None, // pending semantics — never degrades

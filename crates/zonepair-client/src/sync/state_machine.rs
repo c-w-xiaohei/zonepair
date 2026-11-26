@@ -230,36 +230,41 @@ impl<'a> Ctx<'a> {
             && r.registered.is_none()
             && r.materialized.is_none()
     }
-    /// Row 27's zombie shape: `pullPending` and NOTHING else. Two checks
-    /// read wider than their RFC field list, deliberately:
-    ///
-    /// - `materialized` must be ABSENT entirely, not merely `full`-
-    ///   equivalent. Absence equals `full` for the materialization rows,
-    ///   but here an *explicit* `Some(_)` — even `Some(Full)` — is
-    ///   evidence the record once belonged to a real materialized session
-    ///   (the evict/hydrate write sequence is its only writer), which is
-    ///   never the zombie shape. Conservative: exempt, reap it never.
-    /// - `last_unchanged_at` must be absent too: it is written only by a
-    ///   pull that observed `unchanged`, so its presence means the
-    ///   session once pulled real bytes — again never the zombie shape.
-    ///
-    /// Both widenings only ever *shrink* the reap set; a record they
-    /// exempt falls through to the wait-a-round verdict exactly as
-    /// before row 27 existed.
-    fn zombie_intent(&self) -> bool {
-        let r = self.r();
-        r.pull_pending.is_some()
-            && r.pull.is_none()
-            && r.task.is_none()
-            && r.published_at.is_none()
-            && r.deleted.is_none()
-            && r.registered.is_none()
-            && r.materialized.is_none()
-            && r.last_unchanged_at.is_none()
-    }
     fn needs_b(&self) -> bool {
         self.b == BProbe::Unknown
     }
+}
+
+/// Row 27's zombie shape: `pullPending` and NOTHING else — the single
+/// definition both consumers share: the classification row below, and
+/// `reconcile`'s `reap_commit` in-lock re-validation (whose recheck
+/// deliberately reuses this exact conjunct set minus the probe inputs,
+/// since file/B evidence cannot be re-taken inside the commit lock but
+/// the fields can). Two checks read wider than their RFC field list,
+/// deliberately:
+///
+/// - `materialized` must be ABSENT entirely, not merely `full`-
+///   equivalent. Absence equals `full` for the materialization rows,
+///   but here an *explicit* `Some(_)` — even `Some(Full)` — is
+///   evidence the record once belonged to a real materialized session
+///   (the evict/hydrate write sequence is its only writer), which is
+///   never the zombie shape. Conservative: exempt, reap it never.
+/// - `last_unchanged_at` must be absent too: it is written only by a
+///   pull that observed `unchanged`, so its presence means the
+///   session once pulled real bytes — again never the zombie shape.
+///
+/// Both widenings only ever *shrink* the reap set; a record they
+/// exempt falls through to the wait-a-round verdict exactly as
+/// before row 27 existed.
+pub(crate) fn zombie_shape(r: &SessionRecord) -> bool {
+    r.pull_pending.is_some()
+        && r.pull.is_none()
+        && r.task.is_none()
+        && r.published_at.is_none()
+        && r.deleted.is_none()
+        && r.registered.is_none()
+        && r.materialized.is_none()
+        && r.last_unchanged_at.is_none()
 }
 
 static EMPTY_RECORD: SessionRecord = SessionRecord {
@@ -545,7 +550,7 @@ static ROWS: &[Row] = &[
         n: 27,
         needs_b: true,
         test: |c| {
-            c.zombie_intent() && !c.file.exists && c.b == BProbe::Absent
+            zombie_shape(c.r()) && !c.file.exists && c.b == BProbe::Absent
         },
         act: |_| Action::Reap,
     },
