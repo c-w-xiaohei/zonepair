@@ -103,12 +103,22 @@ pub async fn run_pull(ctx: &ExecCtx, sid: &str, force_reset: bool) -> TaskOutcom
                 // `lastUnchangedAt` observation field and lands the
                 // idempotent zero-cursor first pull — both crash-loss-safe
                 // by replay.
+                // The predicate is deliberately wider than spec §4.3's
+                // literal "latest": ANY live pullPending makes this
+                // commit durable. A pinned target can equally be
+                // satisfied by the unchanged verdict (its cursor already
+                // reached), and the pending may have been created
+                // mid-pull after earlier cells passed it — narrowing to
+                // `latest` would lazy-consume it, degrading §9's
+                // `sync --wait` structural signal. The cost of the wider
+                // gate is one durable write in a shape production never
+                // shapes (no pinned intent writers); the cost of the
+                // narrow one is a contract violation.
                 let durable = hydrate
                     || ctx.shared.with_state(|st| {
                         st.sessions
                             .get(sid)
-                            .and_then(|r| r.pull_pending.as_ref())
-                            .is_some_and(|pp| pp.target == "latest")
+                            .is_some_and(|r| r.pull_pending.is_some())
                     });
                 let commit = |st: &mut crate::sync::persist::state::State| {
                     let rec = st.sessions.entry(sid.to_string()).or_default();
@@ -261,9 +271,13 @@ fn commit_pull(ctx: &ExecCtx, sid: &str, next_cursor: &str, rel: &str, hydrate: 
 
 /// Would committing cursor `next_cursor` satisfy this session's
 /// `pullPending`? The durability decision needs the answer BEFORE the
-/// commit — a downgrade race is impossible (a pullPending can only be
-/// consumed or re-stamped forward; either way over-durability is the
-/// worst outcome, never under-).
+/// commit. The residual race is benign in both directions: an existing
+/// pending can only be consumed or re-stamped forward (over-durability
+/// is the worst outcome), and a pending CREATED inside the decision
+/// window can at worst be consumed by a lazy commit — which is not a
+/// durability loss (the lazy generation still rides the next durable
+/// write, and a crash before it replays the pending from the journal,
+/// whose own commit was durable).
 fn would_satisfy(ctx: &ExecCtx, sid: &str, next_cursor: &str) -> bool {
     ctx.shared.with_state(|st| {
         let Some(rec) = st.sessions.get(sid) else {

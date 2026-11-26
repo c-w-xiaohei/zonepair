@@ -181,15 +181,20 @@ impl Shared {
     }
 
     fn commit_impl(&self, f: impl FnOnce(&mut State), durable: bool) -> Result<()> {
-        let lane = self
-            .lane
-            .clone()
-            .or_else(|| state::lookup_lane(&self.sync_dir));
-        let Some(lane) = lane else {
-            // No writer in this process (read-only open): the pre-D2
-            // shape — one lock hold across mutation AND write — stays
-            // the correct serialization exactly because no writer
-            // thread exists and this lock is the only ordering point.
+        // Lane resolution is deliberately self-only: a laneless Shared
+        // (read-only open) must NOT borrow the registry's foreign lane.
+        // That lane serializes its OWN owner's state object — mutations
+        // landing on this one would persist zero bytes yet the bump
+        // could still be acked by the owner's writes: silent success
+        // with zero effect, the worst API shape. (Production never
+        // commits through a read-only open, and two writable opens of
+        // one mirror inside one process are outside the sole-writer
+        // model — but the fallback must be honest, not a trap.)
+        let Some(lane) = self.lane.clone() else {
+            // No writer of our own: the pre-D2 shape — one lock hold
+            // across mutation AND write — stays the correct
+            // serialization exactly because no writer thread exists and
+            // this lock is the only ordering point.
             let mut guard = self.lock();
             f(&mut guard);
             return state::commit(&self.sync_dir, &guard);

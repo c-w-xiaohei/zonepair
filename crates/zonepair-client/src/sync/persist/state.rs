@@ -544,7 +544,28 @@ impl CommitLane {
         let weak = Arc::downgrade(&lane);
         std::thread::Builder::new()
             .name("zp-state-writer".into())
-            .spawn(move || writer_loop(weak))
+            .spawn(move || {
+                // A panicking writer must not silently strand durable
+                // waiters: a thread panic does not kill the process, so
+                // spec §4.4's "panic = process fault" assumption does not
+                // hold by itself. Catch it and poison the lane — every
+                // current and future waiter fails fast instead of
+                // hanging on a condvar nobody will ever signal again.
+                // (The write path carries no unwrap/assert, so this is
+                // defense-in-depth, not an expected path.)
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    writer_loop(weak.clone())
+                }))
+                .is_err()
+                {
+                    if let Some(lane) = weak.upgrade() {
+                        lane.write_failed(
+                            u64::MAX,
+                            "state writer thread panicked — lane dead".into(),
+                        );
+                    }
+                }
+            })
             .expect("spawn zp-state-writer");
         lane
     }
