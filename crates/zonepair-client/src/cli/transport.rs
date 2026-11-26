@@ -366,10 +366,14 @@ pub(crate) async fn transport(argv: &[String]) -> Result<()> {
                 break;
             }
         };
-        if mirror_on {
+        if mirror_on && !shape.no_persist {
             // Parse only frames that could carry evidence: anything while
             // the sid is unknown, or a turn-end marker. JSON errors are
             // ignored — this is observation, not interpretation.
+            // `--no-session-persistence` exempts pull obligations for any
+            // argv shape (§8.3), so E1 owes nothing here — the same
+            // exemption E3 applies below, and the sid's only consumer
+            // (E3) is gated identically.
             let interesting = observed_sid.is_none() || line.contains("\"result\"");
             if interesting {
                 if let Ok(v) = serde_json::from_str::<Value>(&line) {
@@ -485,6 +489,54 @@ mod tests {
         }
     }
 
+    /// Decision-level walk of the E1 relay frame stream. `transport()`
+    /// itself cannot run in-process (the WS relay rides global stdin/stdout
+    /// and ends in `std::process::exit`), so the tests replicate the loop
+    /// body's control flow line for line — the gate predicate is spelled
+    /// exactly as in production so a drift there is visible in review,
+    /// and the persist-arm control proves the simulation itself is
+    /// faithful (frames written ⇒ pulls land in the journal).
+    fn simulate_relay_frames(
+        mirror: &Path,
+        mirror_on: bool,
+        shape: &ArgvShape<'_>,
+        frames: &[&str],
+    ) {
+        let mut observed_sid: Option<String> = None;
+        for line in frames {
+            if mirror_on && !shape.no_persist {
+                let interesting = observed_sid.is_none() || line.contains("\"result\"");
+                if interesting {
+                    if let Ok(v) = serde_json::from_str::<Value>(line) {
+                        if observed_sid.is_none() {
+                            if let Some(s) = v.get("session_id").and_then(Value::as_str) {
+                                observed_sid = Some(s.to_string());
+                            }
+                        }
+                        if v.get("type").and_then(Value::as_str) == Some("result") {
+                            if let Some(sid) = observed_sid.clone() {
+                                enqueue(mirror, pull_latest(&sid)).unwrap();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A realistic B→A frame stream: the sid announcement, two completed
+    /// turns, a non-result frame once the sid is known, and junk JSON.
+    fn side_call_frames() -> Vec<&'static str> {
+        vec![
+            r#"{"type":"system","subtype":"init","session_id":"side1"}"#,
+            r#"{"type":"assistant","session_id":"side1"}"#,
+            r#"{"type":"result","subtype":"success","session_id":"side1"}"#,
+            r#"{"type":"assistant","session_id":"side1"}"#,
+            r#"{"type":"result","subtype":"success","session_id":"side1"}"#,
+            r#"{"type":"result"#,
+        ]
+    }
+
     // T-620: `--session-id X` → `register` lands in the journal; post-relay
     // E3 is `pull(latest)` on the same sid.
     #[test]
@@ -551,6 +603,60 @@ mod tests {
             decide(&shape, &classify::FileProbe::absent(), None),
             PreRelay::ResumeNoop
         );
+    }
+
+    // T-621c (D3b, spec §3.6/§3.7): no-persist argv writes ZERO journal
+    // records while result frames stream through the relay — E1 is a
+    // pull obligation, and `--no-session-persistence` exempts pull for
+    // every argv shape (§8.3). Both no-persist shapes are pinned: the
+    // pure side-call (`--session-id`) and the resume side-call
+    // (`--resume` — its publish obligation is a pre-relay matter, never
+    // an E1/E3 pull).
+    #[test]
+    fn t621c_no_persist_relay_writes_zero_pulls() {
+        for (name, args) in [
+            ("new", &["--session-id", "s1", "--no-session-persistence"][..]),
+            ("resume", &["--resume", "s2", "--no-session-persistence"][..]),
+        ] {
+            let mirror = tmp(&format!("t621c-{name}"));
+            let _owner = hold_owner(&mirror);
+            let shape = shape_of(args);
+            assert!(shape.no_persist);
+            let mirror_on = true;
+            assert!(
+                !(mirror_on && !shape.no_persist),
+                "E1's write gate must stay closed for no-persist argv"
+            );
+            simulate_relay_frames(&mirror, mirror_on, &shape, &side_call_frames());
+            assert!(
+                journal_intents(&mirror).is_empty(),
+                "{name}: no-persist side-call must produce zero journal intents"
+            );
+            std::fs::remove_dir_all(&mirror).unwrap();
+        }
+    }
+
+    // T-621d control arm: without the no-persist flag the same simulation
+    // writes one pull(latest) per completed turn — proving the zero-write
+    // assertion above is earned by the gate, not by a broken simulation.
+    #[test]
+    fn t621d_persist_relay_writes_pulls_per_turn() {
+        let mirror = tmp("t621d");
+        let _owner = hold_owner(&mirror);
+        let shape = shape_of(&["--session-id", "s1"]);
+        assert!(!shape.no_persist);
+        let mirror_on = true;
+        simulate_relay_frames(&mirror, mirror_on, &shape, &side_call_frames());
+        let intents = journal_intents(&mirror);
+        assert_eq!(
+            intents.len(),
+            2,
+            "two result frames ⇒ two pull intents: {intents:?}"
+        );
+        assert!(intents.iter().all(
+            |i| matches!(i, Intent::Pull { sid, target, .. } if sid == "side1" && target == "latest")
+        ));
+        std::fs::remove_dir_all(&mirror).unwrap();
     }
 
     // T-622: fork-resume — file carries `forkedFrom`, no pull/publishedAt,

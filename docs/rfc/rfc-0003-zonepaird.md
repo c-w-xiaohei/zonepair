@@ -66,7 +66,7 @@ While holding the lock, zonepaird is the sole executor of: `state.json` read-mod
 
 ### 3.2 On-demand activation and self-convergence
 
-No dedicated process is responsible for bringing up zonepaird. Whenever a process needs to write an intent and finds the writer absent, it spawns a detached zonepaird in place via `Command::new(current_exe)` (all standard IO redirected to `/dev/null`). N processes doing this simultaneously spawn N zonepairds all grabbing the same lock — exactly one survives; the rest fail the lock grab at step one of the startup sequence and exit immediately, leaving no residue, no retry, no error. **Self-converging, no election protocol.**
+No dedicated process is responsible for bringing up zonepaird. Whenever a process needs to write an intent and finds the writer absent, it spawns a detached zonepaird in place via `Command::new(current_exe)` (stdin and stdout redirected to `/dev/null`; stderr append-logged to `<mirror>/.sync/zonepaird.log`, rotated one generation past 4 MB, `/dev/null` as fallback — self-heartbeat rebirth makes stderr the only forensic channel, and it stays no protocol surface: nobody reads it). N processes doing this simultaneously spawn N zonepairds all grabbing the same lock — exactly one survives; the rest fail the lock grab at step one of the startup sequence and exit immediately, leaving no residue, no retry, no error. **Self-converging, no election protocol.**
 
 ```text
 T0  stub-A and stub-B almost simultaneously find the writer absent
