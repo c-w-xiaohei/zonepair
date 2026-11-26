@@ -4,7 +4,11 @@
 //! 1. **take the lock** — `.sync/` 0700 ensured, `flock(LOCK_EX|LOCK_NB)` on
 //!    `owner.lock`; held → `AlreadyOwned` and the process exits
 //!    immediately (the §3.2 self-convergence rule — the only thing
-//!    keeping two zonepairds from double-writing).
+//!    keeping two zonepairds from double-writing). The lock settling
+//!    also proves this daemon is the writer, so the one-generation
+//!    stderr-log rotation rides here as a sub-step: copy-truncate in
+//!    place (`owner::rotate_stderr_log` — never rename, the fd follows
+//!    the inode), before step 2 starts producing substantive output.
 //! 2. **clear half-finished work** — `*.zp*` residue under `projects/**` (crashed
 //!    reset/evict temp files), `.sync/*.tmp` residue, journal `*.tmp`
 //!    and non-formal debris, plus formal-but-unparseable journal
@@ -24,8 +28,9 @@
 //!    replay still lands intents — execution is what suspends.
 //! 7. **recover in-flight work** — `task{validated}` re-enters the publish queue
 //!    (publish is idempotent); `pull` records resume from their
-//!    committed cursor; `pullPending` re-queues itself (the pick's
-//!    state scan covers it — no explicit enqueue needed).
+//!    committed cursor; `pullPending` re-enqueues explicitly (the boot
+//!    scan's arm (c') — the scheduler is event-fed, nothing re-derives
+//!    the pending from the table).
 //! 8. **startup reconcile** — `reconcile::run(PassKind::Startup)`: tombstone
 //!    filter first, then the joint table; the startup length partition
 //!    trusts `len > bytes` as our own torn tail and truncates.
@@ -133,6 +138,18 @@ pub fn boot(mirror: &Path, parts: ExecParts) -> Result<std::result::Result<Boote
     let Some(owner) = owner::acquire(&sync_dir)? else {
         return Ok(Err(BootBlocked::AlreadyOwned));
     };
+    // The lock settling proves THIS daemon is the writer — so this is
+    // the one place rotation is safe: losers exit at the acquire above
+    // without ever touching the log, and spawners never rotate (a
+    // rename there unlinks the winner's live stderr inode). Best-effort:
+    // a failed rotation must not fail the boot — the log simply grows
+    // past the cap, evidence intact, retried at the next rebirth. The
+    // position is deliberate: step 2's cleanup and step 4's fail-closed
+    // line are the first substantive output, so everything they emit
+    // lands in the post-rotation generation.
+    if let Err(e) = owner::rotate_stderr_log(&sync_dir) {
+        eprintln!("zonepaird: stderr log rotation failed (log grows unrotated): {e:#}");
+    }
     // The SIGTERM target rides next to the lock — best-effort; a stale
     // pid file is harmless (stop probes the lock anyway).
     let _ = owner.write_pid(&sync_dir);
@@ -171,10 +188,15 @@ pub fn boot(mirror: &Path, parts: ExecParts) -> Result<std::result::Result<Boote
     }
 
     // ── 7. recover in-flight work ───────────────────────────────────
-    // `validated` re-enters the publish queue — idempotent, safe to
-    // redo. `pull` records re-enqueue to resume from `pull.cursor`;
-    // `pullPending` needs no explicit enqueue (pick()'s state scan
-    // resurfaces it every round — that IS its queue). `writing` holds:
+    // Three independent recovery arms over the same scan: (a) `validated`
+    // re-enters the publish queue — idempotent, safe to redo; (b) `pull`
+    // records re-enqueue to resume from `pull.cursor` (RFC §9.1-7);
+    // (c') `pullPending` re-enqueues explicitly — before the scheduler's
+    // eventization this arm did not exist because pick()'s state scan
+    // resurfaced the pending every round; the scan is gone, so this arm
+    // is now the pending's boot recovery channel. All three are pure
+    // enqueues: key dedup collapses whatever step 6's replay already
+    // fed, and pick()'s eligibility gates do the rest. `writing` holds:
     // the row itself is the queued state, only ensure-task advances it.
     let mut recovered = 0;
     {
@@ -193,6 +215,13 @@ pub fn boot(mirror: &Path, parts: ExecParts) -> Result<std::result::Result<Boote
                     recovered += 1;
                 }
                 if rec.pull.is_some() && rec.materialization().is_full() {
+                    pool.enqueue(Work::Pull {
+                        sid: sid.clone(),
+                        force_reset: false,
+                    });
+                    recovered += 1;
+                }
+                if rec.pull_pending.is_some() {
                     pool.enqueue(Work::Pull {
                         sid: sid.clone(),
                         force_reset: false,
@@ -391,6 +420,62 @@ mod tests {
         std::fs::remove_dir_all(&mirror).unwrap();
     }
 
+    // The winner rotates; the loser does not. An oversized log at boot
+    // is copy-truncated once the lock settles: bytes survive as `.log.1`,
+    // the live log restarts EMPTY AT THE SAME INODE — the spawned
+    // daemon's stderr fd (bound before the winner was known) never
+    // leaves the visible file. A second boot while the lock is held is
+    // the loser: it must not touch the log at all.
+    #[test]
+    fn winner_rotates_log_at_boot_and_loser_does_not() {
+        let mirror = tmp("boot-rotate");
+        let sync = state::ensure_sync_dir(&mirror).unwrap();
+        let log = sync.join(owner::STDERR_LOG_FILE);
+        let rotated = sync.join(format!("{}.1", owner::STDERR_LOG_FILE));
+        std::fs::write(&log, vec![b'x'; (owner::STDERR_LOG_MAX_BYTES + 1) as usize]).unwrap();
+        #[cfg(unix)]
+        let inode_before = {
+            use std::os::unix::fs::MetadataExt;
+            log.metadata().unwrap().ino()
+        };
+
+        let first = boot(&mirror, unknown_b_probe()).unwrap().unwrap();
+        assert_eq!(
+            std::fs::read(&rotated).unwrap().len() as u64,
+            owner::STDERR_LOG_MAX_BYTES + 1,
+            "the dying generation is preserved as .log.1"
+        );
+        assert_eq!(
+            log.metadata().unwrap().len(),
+            0,
+            "the winner's generation starts empty"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                log.metadata().unwrap().ino(),
+                inode_before,
+                "copy-truncate keeps the inode — no fd redirection needed"
+            );
+        }
+
+        // The loser (second boot over the held lock) rotates nothing:
+        // drop a fresh oversized file in place and prove AlreadyOwned
+        // leaves it byte-identical — a loser's rotation would be the
+        // original Finding-1 shape wearing a new coat.
+        std::fs::write(&log, vec![b'y'; (owner::STDERR_LOG_MAX_BYTES + 1) as usize]).unwrap();
+        let second = boot(&mirror, unknown_b_probe()).unwrap();
+        assert!(matches!(second, Err(BootBlocked::AlreadyOwned)));
+        assert_eq!(
+            log.metadata().unwrap().len(),
+            owner::STDERR_LOG_MAX_BYTES + 1,
+            "the loser exits before ever touching the log"
+        );
+        drop(first);
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
     // T-631: boot step 2 — `*.zp*` mirror residue, `.sync/*.tmp`,
     // journal `*.tmp` + odd debris, and a formal-but-unparseable record
     // all disappear; the VALID record survives for step 6 to consume.
@@ -538,8 +623,8 @@ mod tests {
     }
 
     // T-634: step 7 re-queues in-flight work — a `validated` task
-    // resurfaces Publish; a live `pull` record resumes (pullPending
-    // self-resurfaces through the state scan).
+    // resurfaces Publish (arm a); a live `pull` record resumes (arm b);
+    // a `pullPending` re-enqueues explicitly (arm c').
     #[test]
     fn t634_inflight_recovery_requeues_validated_and_pull() {
         let mirror = tmp("t634");
@@ -587,10 +672,157 @@ mod tests {
         state::commit(&sync, &st).unwrap();
 
         let booted = boot(&mirror, unknown_b_probe()).unwrap().unwrap();
-        assert!(booted.report.recovered >= 2);
+        assert_eq!(
+            booted.report.recovered, 3,
+            "arm (a) validated + arm (b) pull + arm (c') pullPending"
+        );
         // Validated → Publish is the top pick (rank 0 beats pull).
         let first = booted.pool.pick().unwrap();
         assert_eq!(first, Work::Publish { sid: "pub".into() });
+        drop(booted);
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // Arm (c'): a boot-time `pullPending` record (the zombie shape — no
+    // other fields, no file) re-enqueues its pull explicitly. The
+    // `recovered` count is the pin: the startup reconcile's verdict
+    // emission (reconcile.rs's pullPending re-push) is a parallel channel
+    // that dedup-collapses into the same queue entry, so only the count
+    // proves arm (c') itself fired.
+    #[test]
+    fn boot_recovers_pull_pending_via_explicit_enqueue() {
+        let mirror = tmp("boot-pp");
+        let sync = state::ensure_sync_dir(&mirror).unwrap();
+        let mut st = State::empty_v3();
+        st.sessions.insert(
+            "pp".into(),
+            SessionRecord {
+                pull_pending: Some(PullPending {
+                    target: "latest".into(),
+                    enqueued_at: "t".into(),
+                    record: None,
+                }),
+                ..Default::default()
+            },
+        );
+        state::commit(&sync, &st).unwrap();
+
+        let booted = boot(&mirror, unknown_b_probe()).unwrap().unwrap();
+        assert_eq!(
+            booted.report.recovered, 1,
+            "exactly arm (c') fires — the pending's boot channel"
+        );
+        assert!(
+            booted
+                .shared
+                .with_state(|st| st.sessions["pp"].pull_pending.is_some()),
+            "the pending survives boot — nothing consumes it"
+        );
+        let work = booted.pool.pick().expect("arm (c') enqueued the pull");
+        assert_eq!(
+            work,
+            Work::Pull {
+                sid: "pp".into(),
+                force_reset: false
+            },
+            "boot feeds the pending's pull explicitly: {work:?}"
+        );
+        drop(booted);
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // Arm (b) regression pin (RFC §9.1-7): a boot-time record carrying
+    // ONLY `pull` — no `pullPending`, no traffic since — re-enqueues to
+    // resume from its committed cursor. Without this arm the session
+    // goes silent until the next E4 tick or sweep verdict; and because
+    // this shape carries no `pullPending`, the reconcile verdict
+    // emission has nothing to re-push — `recovered` here isolates the
+    // arm completely.
+    #[test]
+    fn boot_recovers_pull_only_record() {
+        let mirror = tmp("boot-pullonly");
+        let sync = state::ensure_sync_dir(&mirror).unwrap();
+        // Cursor covers exactly the file's bytes — a clean steady row
+        // (row 16 + §7.2 length-clean), so the startup reconcile neither
+        // truncates nor suspends nor produces competing work.
+        write_file(&mirror, "projects/lab/s1.jsonl", b"1234567");
+        let mut st = State::empty_v3();
+        st.sessions.insert(
+            "s1".into(),
+            SessionRecord {
+                pull: Some(Pull {
+                    cursor: "zpc1.7.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    file: "projects/lab/s1.jsonl".into(),
+                }),
+                ..Default::default()
+            },
+        );
+        state::commit(&sync, &st).unwrap();
+
+        let booted = boot(&mirror, unknown_b_probe()).unwrap().unwrap();
+        assert_eq!(booted.report.recovered, 1, "exactly the pull arm fires");
+        let work = booted.pool.pick().expect("arm (b) enqueued the pull");
+        assert_eq!(
+            work,
+            Work::Pull {
+                sid: "s1".into(),
+                force_reset: false
+            },
+            "pull-only record resumes from its cursor: {work:?}"
+        );
+        drop(booted);
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // Tombstoned records never produce boot candidates — the suppress
+    // outranks every recovery arm (§5). Driven through the production
+    // flow: a live pull record, a `note-remote-delete` intent replayed
+    // at step 6, then step 7's scan must skip what bury left behind —
+    // and since bury clears every work-triggering field in its own
+    // transaction, the genuine tombstone shape is the only one this
+    // path can ever see.
+    #[test]
+    fn boot_never_enqueues_tombstoned_records() {
+        let mirror = tmp("boot-tomb");
+        let sync = state::ensure_sync_dir(&mirror).unwrap();
+        let journal_dir = sync.join("journal");
+        state::ensure_dir(&journal_dir, 0o700).unwrap();
+        let mut st = State::empty_v3();
+        st.sessions.insert(
+            "s1".into(),
+            SessionRecord {
+                pull: Some(Pull {
+                    cursor: "zpc1.7.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    file: "projects/lab/s1.jsonl".into(),
+                }),
+                pull_pending: Some(PullPending {
+                    target: "latest".into(),
+                    enqueued_at: "t".into(),
+                    record: None,
+                }),
+                ..Default::default()
+            },
+        );
+        state::commit(&sync, &st).unwrap();
+        journal::append(
+            &journal_dir,
+            &journal::Intent::NoteRemoteDelete {
+                sid: "s1".into(),
+                enqueued_at: "t2".into(),
+            },
+        )
+        .unwrap();
+
+        let booted = boot(&mirror, unknown_b_probe()).unwrap().unwrap();
+        assert!(
+            booted.shared.with_state(|st| st.sessions["s1"].deleted.is_some()),
+            "the replayed tombstone lands before step 7"
+        );
+        assert!(
+            booted.pool.pick().is_none(),
+            "a tombstoned record must never yield boot work"
+        );
+        drop(booted);
         std::fs::remove_dir_all(&mirror).unwrap();
     }
 

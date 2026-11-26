@@ -623,10 +623,11 @@ mod tests {
             let shape = shape_of(args);
             assert!(shape.no_persist);
             let mirror_on = true;
-            assert!(
-                !(mirror_on && !shape.no_persist),
-                "E1's write gate must stay closed for no-persist argv"
-            );
+            // No further gate assertion here: the gate under test is the
+            // one inside `simulate_relay_frames`, spelled exactly as in
+            // production — asserting on its inputs would be a tautology.
+            // What proves the gate closed is the zero-journal assertion
+            // below, with t621d as the open-gate control arm.
             simulate_relay_frames(&mirror, mirror_on, &shape, &side_call_frames());
             assert!(
                 journal_intents(&mirror).is_empty(),

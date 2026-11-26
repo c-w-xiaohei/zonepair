@@ -31,7 +31,8 @@
 
 use anyhow::Result;
 use futures_util::FutureExt;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
@@ -195,6 +196,61 @@ struct Book {
     in_flight: bool,
 }
 
+/// The book store: the key-indexed map plus a `next_at`-ordered heap used
+/// as the due index, so `pick()` never scans the whole map (the old
+/// O(books) due-scan). The heap is a lazy index: entries are pushed every
+/// time a live (non-in-flight) book's `next_at` is (re)assigned, never
+/// removed eagerly. Stale entries — an earlier `next_at` of a rebooked
+/// book, or the residue of a removed/degraded/expired book — are detected
+/// at pop time (key missing in the map, `in_flight`, or `next_at`
+/// mismatch) and simply dropped. Chosen over tombstones because deletion
+/// here is *identical* to skipping stale entries at pop: every writer of
+/// a book already pushes a fresh entry, so the heap only ever carries
+/// garbage proportional to the number of books written since boot —
+/// bounded by the drain/boot cadence, never by idle uptime.
+struct Books {
+    map: HashMap<String, Book>,
+    /// `(next_at, key)` min-heap via `Reverse` — the earliest-due entry
+    /// pops first; `key` breaks `Instant` ties deterministically.
+    due: BinaryHeap<Reverse<(Instant, String)>>,
+}
+
+impl Books {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            due: BinaryHeap::new(),
+        }
+    }
+
+    fn push_due(&mut self, next_at: Instant, key: &str) {
+        self.due.push(Reverse((next_at, key.to_string())));
+    }
+
+    /// Drain every due book out of the map for selection. Stale heap
+    /// entries are dropped here (lazy deletion); live heap entries whose
+    /// book is not yet due stay in the heap untouched — ordering the heap
+    /// by `next_at` means the first not-due peek ends the scan.
+    fn take_due(&mut self, now: Instant) -> Vec<Book> {
+        let mut out = Vec::new();
+        loop {
+            let Some(Reverse((at, key))) = self.due.peek() else { break };
+            if *at > now {
+                break;
+            }
+            let (at, key) = (*at, key.clone());
+            self.due.pop();
+            match self.map.get(&key) {
+                Some(b) if !b.in_flight && b.next_at == at => {
+                    out.push(self.map.remove(&key).unwrap());
+                }
+                _ => {} // stale: rebooked, in-flight, removed, or expired
+            }
+        }
+        out
+    }
+}
+
 /// The §6.2 scheduler. All mutable scheduling state lives behind short
 /// `Mutex` holds — the pool itself is `Arc`-shared between the daemon's
 /// producer side (journal/reconcile enqueueing) and worker tasks.
@@ -202,7 +258,7 @@ pub struct Pool {
     ctx: ExecCtx,
     policy: RetryPolicy,
     pending: Mutex<VecDeque<(u64, Work)>>,
-    books: Mutex<HashMap<String, Book>>,
+    books: Mutex<Books>,
     /// Running keys — dedup + dispatch bookkeeping.
     running: Mutex<HashSet<String>>,
     /// Running sids — the "same sid strictly serial" guarantee.
@@ -232,7 +288,7 @@ impl Pool {
             ctx,
             policy: RetryPolicy::default(),
             pending: Mutex::new(VecDeque::new()),
-            books: Mutex::new(HashMap::new()),
+            books: Mutex::new(Books::new()),
             running: Mutex::new(HashSet::new()),
             running_sids: Mutex::new(HashSet::new()),
             seq: AtomicU64::new(0),
@@ -287,7 +343,7 @@ impl Pool {
                     .extend(names.iter().cloned());
                 return;
             }
-            if let Some(book) = self.books.lock().unwrap().get_mut("reconcile") {
+            if let Some(book) = self.books.lock().unwrap().map.get_mut("reconcile") {
                 if let Work::Reconcile { names: existing } = &mut book.work {
                     existing.extend(names.iter().cloned());
                     return;
@@ -295,7 +351,7 @@ impl Pool {
             }
         }
         if pending.iter().any(|(_, w)| w.key() == key)
-            || self.books.lock().unwrap().contains_key(&key)
+            || self.books.lock().unwrap().map.contains_key(&key)
             || self.running.lock().unwrap().contains(&key)
         {
             return;
@@ -353,6 +409,29 @@ impl Pool {
         if !fresh.is_empty() {
             self.enqueue(Work::Reconcile { names: fresh });
         }
+        // The eventized candidate feed: `pullPending` and `task.validated`
+        // have exactly one write point each — this very consumption path
+        // (`merge_pull_pending` / `ensure_task`, both inside `apply`). A
+        // pull intent that APPLIED owes a pull; an ensure-task that
+        // applied owes a publish. Enqueueing unconditionally is safe: the
+        // key dedup (pending/books/running) plus pick()'s eligibility
+        // gates absorb every no-op replay and every already-represented
+        // obligation. Dropped intents (tombstone suppression) and
+        // deferred evict/hydrate shapes never reach here.
+        for entry in &report.consumed {
+            let (Some(intent), Ok(journal::Effect::Applied)) = (&entry.intent, &entry.effect)
+            else {
+                continue;
+            };
+            match intent {
+                Intent::Pull { sid, .. } => self.enqueue(Work::Pull {
+                    sid: sid.clone(),
+                    force_reset: false,
+                }),
+                Intent::EnsureTask { sid, .. } => self.enqueue(Work::Publish { sid: sid.clone() }),
+                _ => {}
+            }
+        }
         for sid in &report.applied_sids {
             self.ctx.shared.notify.signal(sid);
         }
@@ -365,13 +444,16 @@ impl Pool {
     /// pending books never
     /// expire.
     ///
-    /// Candidates come from three sources and their fate differs:
-    /// `pending` entries (journal-derived work carrying payloads like
-    /// reconcile record names) MUST be requeued when they lose —
-    /// deduplication collapses them into one entry only when their key
-    /// won; due books are held aside and restored (the chosen one marked
-    /// `in_flight` so `finish` continues its accounting); state-derived
-    /// candidates are re-derived every pick, so they need no storage.
+    /// Candidates come from two sources and their fate differs: `pending`
+    /// entries (journal-derived work carrying payloads like reconcile
+    /// record names) MUST be requeued when they lose — deduplication
+    /// collapses them into one entry only when their key won; due books
+    /// are held aside and restored (the chosen one marked `in_flight` so
+    /// `finish` continues its accounting). Work arrives at the queue
+    /// event-side only: journal consumption (`drain_journal`), boot
+    /// recovery (startup step 7), reconcile verdicts, executor re-books
+    /// and the `finish()` revival seam — `pick()` itself never derives
+    /// candidates from the state table.
     ///
     /// Eligibility filters, in order: running-key dedup, same-sid
     /// serialization (any sid-bearing work blocks on an already-running
@@ -380,36 +462,21 @@ impl Pool {
     /// append would read as a bogus length mismatch), and the suspension
     /// overlay (`manual` blocks pull+publish; `pull` blocks pulls; a
     /// `force_reset` healing pull bypasses both — it is the convergence).
-    /// A state-resurfacing candidate also yields to a live (non-due)
-    /// book of the same key — otherwise a cooled-down `Pending` would
-    /// hot-loop on the state's `pullPending` field.
     pub fn pick(&self) -> Option<Work> {
-        enum Src {
-            Pending,
-            Book,
-            State,
-        }
-
         let now = Instant::now();
         let mut due_books: Vec<Book> = Vec::new();
         let mut expired: Vec<Work> = Vec::new();
-        let mut candidates: Vec<(u8, u64, Src, Work)> = Vec::new();
+        let mut candidates: Vec<(u8, u64, Work)> = Vec::new();
         {
-            // Due books leave the map for selection; expired retry books
-            // degrade below (outside the lock — degrade commits state).
-            let mut books = self.books.lock().unwrap();
-            let due_keys: Vec<String> = books
-                .iter()
-                .filter(|(_, b)| !b.in_flight && b.next_at <= now)
-                .map(|(k, _)| k.clone())
-                .collect();
-            for key in due_keys {
-                let book = books.remove(&key).unwrap();
+            // Due books leave the map for selection (heap-indexed — no
+            // full-map scan); expired retry books degrade below (outside
+            // the lock — degrade commits state).
+            for book in self.books.lock().unwrap().take_due(now) {
                 if book.deadline.is_some_and(|d| now >= d) {
                     expired.push(book.work);
                 } else {
                     let seq = u64::MAX - book.attempt as u64;
-                    candidates.push((book.work.rank(), seq, Src::Book, book.work.clone()));
+                    candidates.push((book.work.rank(), seq, book.work.clone()));
                     due_books.push(book);
                 }
             }
@@ -423,67 +490,29 @@ impl Pool {
             pending.drain(..).collect()
         };
         for (seq, work) in &drained {
-            candidates.push((work.rank(), *seq, Src::Pending, work.clone()));
+            candidates.push((work.rank(), *seq, work.clone()));
         }
-        // State-driven candidates: validated tasks → publish; pullPending
-        // → pull. Tombstoned records never yield work — the tombstone
-        // outranks everything (§5). These re-derive every pick; nothing
-        // is persisted from them.
-        self.ctx.shared.with_state(|st| {
-            for (sid, rec) in &st.sessions {
-                if rec.deleted.is_some() {
-                    continue;
-                }
-                if rec.task.as_ref().is_some_and(|t| t.phase == Phase::Validated) {
-                    candidates.push((0, 0, Src::State, Work::Publish { sid: sid.clone() }));
-                }
-                if rec.pull_pending.is_some() {
-                    candidates.push((
-                        2,
-                        0,
-                        Src::State,
-                        Work::Pull {
-                            sid: sid.clone(),
-                            force_reset: false,
-                        },
-                    ));
-                }
-            }
-        });
         let susp = self.ctx.shared.suspend.lock().unwrap();
         let running = self.running.lock().unwrap();
         let mut running_sids = self.running_sids.lock().unwrap();
         let reconcile_running = running.contains("reconcile");
         // Dedup by key keeping the best (rank, seq).
-        let mut best: HashMap<String, (u8, u64, Src, Work)> = HashMap::new();
-        for (rank, seq, src, work) in candidates {
-            // State-resurfacing work yields to a live (non-due) book —
-            // the book's cooldown is the only thing keeping a Pending
-            // from hot-looping against its own persisted intent field.
-            if matches!(src, Src::State)
-                && self
-                    .books
-                    .lock()
-                    .unwrap()
-                    .get(&work.key())
-                    .is_some_and(|b| !b.in_flight)
-            {
-                continue;
-            }
+        let mut best: HashMap<String, (u8, u64, Work)> = HashMap::new();
+        for (rank, seq, work) in candidates {
             let key = work.key();
             match best.get(&key) {
-                Some((r, s, _, _)) if (*r, *s) <= (rank, seq) => {}
+                Some((r, s, _)) if (*r, *s) <= (rank, seq) => {}
                 _ => {
-                    best.insert(key, (rank, seq, src, work));
+                    best.insert(key, (rank, seq, work));
                 }
             }
         }
-        let mut eligible: Vec<(u8, u64, Src, Work)> = best.into_values().collect();
+        let mut eligible: Vec<(u8, u64, Work)> = best.into_values().collect();
         // (rank, seq) is the RFC order; `key` breaks exact ties so equal
         // candidates pick deterministically regardless of map order.
-        eligible.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)).then_with(|| a.3.key().cmp(&b.3.key())));
+        eligible.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)).then_with(|| a.2.key().cmp(&b.2.key())));
         let mut chosen: Option<Work> = None;
-        for (_, _, _, work) in eligible {
+        for (_, _, work) in eligible {
             let key = work.key();
             if running.contains(&key) {
                 continue;
@@ -534,7 +563,12 @@ impl Pool {
             let mut books = self.books.lock().unwrap();
             for mut book in due_books {
                 book.in_flight = chosen_key.as_deref() == Some(book.work.key().as_str());
-                books.insert(book.work.key(), book);
+                if !book.in_flight {
+                    // Back on the shelf: its heap entries were drained
+                    // above, so the due index needs a fresh one.
+                    books.push_due(book.next_at, &book.work.key());
+                }
+                books.map.insert(book.work.key(), book);
             }
         }
         chosen
@@ -653,7 +687,7 @@ impl Pool {
         }
         match outcome {
             TaskOutcome::Done => {
-                self.books.lock().unwrap().remove(&key);
+                self.books.lock().unwrap().map.remove(&key);
                 if let Work::Materialize { name, .. } = work {
                     // §4.3-4③: the record file deletes only now — after
                     // the executor's `materialized` commit. An earlier
@@ -679,22 +713,74 @@ impl Pool {
                     // A healing pull that completed lifts the pull overlay.
                     self.ctx.shared.suspend.lock().unwrap().pull.remove(sid);
                 }
+                // The finish() revival seam: a sid-carrying task Done with
+                // a LIVE `pullPending` still owes the pull the intent
+                // attests (a pinned target B has not grown to yet — or
+                // never will, §7.2's conserved divergence). This is not
+                // `Work::Pull`-shaped: the materialize hydrate arm calls
+                // `run_pull` directly, so it too can end Done-with-live-
+                // pending — hence no Work-type filter, only "the outcome
+                // is Done and the sid still carries the obligation".
+                // Ordering is the concurrency argument: the running key
+                // was removed at the top of `finish`, so an intent landing
+                // in the executor's end-window has exactly two converging
+                // paths — the drain's enqueue either deduped against the
+                // still-running key (this check then sees its freshly-
+                // committed `pullPending` and books) or enqueued live
+                // after the removal (this book then dedups against it).
+                // The re-booked payload is a PLAIN pull — never the
+                // finished work verbatim: the materialize obligation is
+                // already durable (the `materialized` commit landed), and
+                // re-booking the hydrate's `force_reset:true` would pay a
+                // whole-file reset every round. Tombstoned records never
+                // book: bury already cleared the pending in the same
+                // transaction, and the dead guard merely double-checks.
+                if let Some(sid) = work.sid() {
+                    let owed = self.ctx.shared.with_state(|st| {
+                        st.sessions
+                            .get(sid)
+                            .is_some_and(|r| r.deleted.is_none() && r.pull_pending.is_some())
+                    });
+                    if owed {
+                        let mut books = self.books.lock().unwrap();
+                        let pull_key = format!("pull:{sid}:false");
+                        if !books.map.contains_key(&pull_key) {
+                            let next_at = Instant::now() + self.policy.pending_cooldown;
+                            books.push_due(next_at, &pull_key);
+                            books.map.insert(
+                                pull_key,
+                                Book {
+                                    work: Work::Pull {
+                                        sid: sid.to_string(),
+                                        force_reset: false,
+                                    },
+                                    attempt: 0,
+                                    next_at,
+                                    deadline: None, // pending semantics — never degrades
+                                    in_flight: false,
+                                },
+                            );
+                        }
+                    }
+                }
             }
             TaskOutcome::Pending(_) => {
                 let mut books = self.books.lock().unwrap();
-                let book = books.entry(key).or_insert_with(|| Book {
+                let next_at = Instant::now() + self.policy.pending_cooldown;
+                let book = books.map.entry(key.clone()).or_insert_with(|| Book {
                     work: work.clone(),
                     attempt: 0,
-                    next_at: Instant::now(),
+                    next_at,
                     deadline: None, // pending is budget-free
                     in_flight: false,
                 });
                 book.in_flight = false;
-                book.next_at = Instant::now() + self.policy.pending_cooldown;
+                book.next_at = next_at;
+                books.push_due(next_at, &key);
             }
             TaskOutcome::Retry(reason) => {
                 let mut books = self.books.lock().unwrap();
-                let book = books.entry(key.clone()).or_insert_with(|| Book {
+                let book = books.map.entry(key.clone()).or_insert_with(|| Book {
                     work: work.clone(),
                     attempt: 0,
                     next_at: Instant::now(),
@@ -715,10 +801,12 @@ impl Pool {
                     return;
                 }
                 let idx = ((book.attempt - 1) as usize).min(self.policy.backoffs.len() - 1);
-                book.next_at = Instant::now() + self.policy.backoffs[idx];
+                let next_at = Instant::now() + self.policy.backoffs[idx];
+                book.next_at = next_at;
+                books.push_due(next_at, &key);
             }
             TaskOutcome::Degraded(reason) => {
-                self.books.lock().unwrap().remove(&key);
+                self.books.lock().unwrap().map.remove(&key);
                 self.degrade_work(work, &reason);
             }
         }
@@ -960,43 +1048,36 @@ mod tests {
 
     // T-610a: selection order — publish beats materialize beats pull
     // beats reconcile. (The waited/background pull split retired with
-    // `wait_cursor`; both pulls carry one rank now.)
+    // `wait_cursor`; both pulls carry one rank now.) Candidates arrive
+    // through the eventized feed — journal intents consumed by
+    // `drain_journal` — never through a state scan: the asserted order is
+    // the eligibility/rank logic's, independent of the feed.
     #[tokio::test]
     async fn t610_selection_order() {
         let (mirror, shared) = setup("t610a");
-        shared
-            .commit_state(|st| {
-                // publish candidate via state scan.
-                st.sessions.insert(
-                    "pub".into(),
-                    SessionRecord {
-                        task: Some(state::Task {
-                            file: "f".into(),
-                            phase: Phase::Validated,
-                            first_seen: "t".into(),
-                            enqueued_at: "t".into(),
-                            last_error: None,
-                        }),
-                        ..Default::default()
-                    },
-                );
-                // two pulls — same rank now; seq order decides which goes.
-                for sid in ["wpull", "bpull"] {
-                    st.sessions.insert(
-                        sid.into(),
-                        SessionRecord {
-                            pull_pending: Some(state::PullPending {
-                                target: "latest".into(),
-                                enqueued_at: "t".into(),
-                            record: None,
-                            }),
-                            ..Default::default()
-                        },
-                    );
-                }
-            })
-            .unwrap();
+        // Journal records with FIXED filenames — consume order is
+        // lexicographic (§4.3-1), so the enqueue seq order below is exact:
+        // ensure-task (publish candidate), then two pulls — same rank;
+        // FIFO seq order decides which one picks first.
+        let records = [
+            (
+                "100-1-1.json",
+                r#"{"op":"ensure-task","kind":"publish","sid":"pub","file":"f","phase":"validated","enqueuedAt":"t"}"#,
+            ),
+            (
+                "200-1-1.json",
+                r#"{"op":"pull","sid":"wpull","target":"latest","enqueuedAt":"t"}"#,
+            ),
+            (
+                "300-1-1.json",
+                r#"{"op":"pull","sid":"bpull","target":"latest","enqueuedAt":"t"}"#,
+            ),
+        ];
+        for (name, body) in records {
+            std::fs::write(shared.journal_dir.join(name), body).unwrap();
+        }
         let pool = Pool::new(ExecCtx::new(shared.clone()));
+        pool.drain_journal().unwrap();
         pool.enqueue(Work::Reconcile { names: vec![] });
         pool.enqueue(Work::Materialize {
             name: "1-1-1.json".into(),
@@ -1009,18 +1090,10 @@ mod tests {
         // Each picked work is finished before the next pick — the
         // reconcile barrier (pool must be empty) would otherwise mask
         // the rank order this test asserts. `finish` is not the executor:
-        // it does not commit state, so each pick is followed by the
-        // commit the real executor would have made — otherwise the
-        // state scan re-offers the same work next round.
-        let finish_publish = |shared: &Shared, sid: &str| {
-            shared
-                .commit_state(|st| {
-                    st.sessions.get_mut(sid).unwrap().task.as_mut().unwrap().phase =
-                        Phase::Published;
-                })
-                .unwrap();
-        };
-        let finish_pull = |shared: &Shared, sid: &str| {
+        // it does not commit state, so the pulls' pendings are satisfied
+        // the way the real executor would — otherwise finish()'s revival
+        // seam correctly re-books each unsatisfied pull intent.
+        let satisfy = |shared: &Shared, sid: &str| {
             shared
                 .commit_state(|st| {
                     st.sessions.get_mut(sid).unwrap().satisfy_pull_pending();
@@ -1030,7 +1103,6 @@ mod tests {
         let first = pool.pick().unwrap();
         assert_eq!(first, Work::Publish { sid: "pub".into() }, "publish first");
         pool.finish(&first, TaskOutcome::Done);
-        finish_publish(&shared, "pub");
         let second = pool.pick().unwrap();
         assert!(matches!(second, Work::Materialize { .. }), "evict/hydrate second");
         pool.finish(&second, TaskOutcome::Done);
@@ -1038,24 +1110,24 @@ mod tests {
         assert_eq!(
             third,
             Work::Pull {
-                sid: "bpull".into(),
+                sid: "wpull".into(),
                 force_reset: false
             },
-            "pulls tie on rank — key order decides"
+            "pulls tie on rank — FIFO seq order decides (wpull drained first)"
         );
+        satisfy(&shared, "wpull");
         pool.finish(&third, TaskOutcome::Done);
-        finish_pull(&shared, "bpull");
         let fourth = pool.pick().unwrap();
         assert_eq!(
             fourth,
             Work::Pull {
-                sid: "wpull".into(),
+                sid: "bpull".into(),
                 force_reset: false
             },
             "second pull fourth"
         );
+        satisfy(&shared, "bpull");
         pool.finish(&fourth, TaskOutcome::Done);
-        finish_pull(&shared, "wpull");
         let fifth = pool.pick().unwrap();
         assert!(matches!(fifth, Work::Reconcile { .. }), "reconcile last");
         std::fs::remove_dir_all(&mirror).unwrap();
@@ -1146,7 +1218,7 @@ mod tests {
         pool.finish(&work, TaskOutcome::Retry("x".into()));
         {
             let books = pool.books.lock().unwrap();
-            let b = &books["pull:s1:false"];
+            let b = &books.map["pull:s1:false"];
             assert_eq!(b.attempt, 1);
             // First backoff ≈ 30ms (injected 1s equivalent).
             let dt = b.next_at.duration_since(Instant::now());
@@ -1155,7 +1227,7 @@ mod tests {
         pool.finish(&work, TaskOutcome::Retry("x".into()));
         {
             let books = pool.books.lock().unwrap();
-            let b = &books["pull:s1:false"];
+            let b = &books.map["pull:s1:false"];
             assert_eq!(b.attempt, 2);
             let dt = b.next_at.duration_since(Instant::now());
             assert!(dt > Duration::from_millis(35), "second step is longer: {dt:?}");
@@ -1217,9 +1289,18 @@ mod tests {
         // The reconcile record is deferred — file still there, work queued.
         assert_eq!(report.reconcile_records.len(), 1);
         assert!(shared.journal_dir.join(&report.reconcile_records[0]).exists());
-        // `pull` landed as pullPending → scanned pull work is pickable;
-        // reconcile sits in pending behind it.
+        // `pull` landed as pullPending → the eventized feed enqueued its
+        // pull work at consumption; reconcile sits in pending behind it.
         assert!(shared.with_state(|st| st.sessions["s1"].pull_pending.is_some()));
+        let first = pool.pick().expect("applied pull intent is pickable work");
+        assert!(
+            matches!(&first, Work::Pull { sid, force_reset: false } if sid == "s1"),
+            "pull intent feeds pick() without a state scan: {first:?}"
+        );
+        pool.finish(&first, TaskOutcome::Done);
+        let second = pool.pick().expect("reconcile behind it");
+        assert!(matches!(second, Work::Reconcile { .. }), "{second:?}");
+        pool.finish(&second, TaskOutcome::Done);
         // finish(Reconcile::Done) deletes the record files.
         let name = report.reconcile_records[0].clone();
         pool.finish(
@@ -1238,22 +1319,11 @@ mod tests {
     #[tokio::test]
     async fn reconcile_is_a_pool_barrier() {
         let (mirror, shared) = setup("barrier");
-        shared
-            .commit_state(|st| {
-                st.sessions.insert(
-                    "s1".into(),
-                    SessionRecord {
-                        pull_pending: Some(state::PullPending {
-                            target: "latest".into(),
-                            enqueued_at: "t".into(),
-                        record: None,
-                        }),
-                        ..Default::default()
-                    },
-                );
-            })
-            .unwrap();
         let pool = Pool::new(ExecCtx::new(shared.clone()));
+        pool.enqueue(Work::Pull {
+            sid: "s1".into(),
+            force_reset: false,
+        });
         pool.enqueue(Work::Reconcile { names: vec![] });
         // Rank order first: the background pull outranks reconcile.
         let first = pool.pick().unwrap();
@@ -1341,5 +1411,282 @@ mod tests {
             stderr.contains("zonepaird: reconcile: s1: suspended (BLostRecovery)"),
             "steady reconcile notes must reach stderr: {stderr}"
         );
+    }
+
+    // The eventized candidate feed: applied pull/ensure-task intents
+    // enqueue their work at journal consumption — pick() serves it
+    // directly, with no reconcile pass and no state scan involved.
+    #[tokio::test]
+    async fn applied_intents_feed_pick_eventwise() {
+        let (mirror, shared) = setup("eventfeed");
+        journal::append(
+            &shared.journal_dir,
+            &Intent::Pull {
+                sid: "s1".into(),
+                target: "latest".into(),
+                enqueued_at: "t".into(),
+            },
+        )
+        .unwrap();
+        journal::append(
+            &shared.journal_dir,
+            &Intent::EnsureTask {
+                sid: "s2".into(),
+                file: "projects/lab/s2.jsonl".into(),
+                phase: Phase::Validated,
+                enqueued_at: "t".into(),
+            },
+        )
+        .unwrap();
+        let pool = Pool::new(ExecCtx::new(shared.clone()));
+        pool.drain_journal().unwrap();
+        // Publish outranks pull; both come straight off the drain.
+        let first = pool.pick().unwrap();
+        assert_eq!(first, Work::Publish { sid: "s2".into() }, "{first:?}");
+        pool.finish(&first, TaskOutcome::Done);
+        let second = pool.pick().unwrap();
+        assert_eq!(
+            second,
+            Work::Pull {
+                sid: "s1".into(),
+                force_reset: false
+            },
+            "{second:?}"
+        );
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // The finish() revival seam: a pull finishing Done while its pinned
+    // `pullPending` still lives (B has not grown to the target — or the
+    // fingerprint never will, §7.2's conserved divergence) books the pull
+    // again on the Pending cadence — budget-free, 250ms-class cooldown.
+    // The control: a satisfied pending (the normal latest convergence)
+    // books nothing.
+    #[tokio::test]
+    async fn finish_revives_done_with_live_pull_pending() {
+        let (mirror, shared) = setup("revival");
+        shared
+            .commit_state(|st| {
+                for sid in ["pinned", "satisfied"] {
+                    st.sessions.insert(
+                        sid.into(),
+                        SessionRecord {
+                            pull_pending: Some(state::PullPending {
+                                target: "latest".into(),
+                                enqueued_at: "t".into(),
+                            record: None,
+                            }),
+                            ..Default::default()
+                        },
+                    );
+                }
+            })
+            .unwrap();
+        let pool = Pool::new(ExecCtx::new(shared.clone())).with_policy(fast_policy());
+        let pinned = Work::Pull {
+            sid: "pinned".into(),
+            force_reset: false,
+        };
+        pool.finish(&pinned, TaskOutcome::Done);
+        {
+            let books = pool.books.lock().unwrap();
+            let book = &books.map["pull:pinned:false"];
+            assert_eq!(book.attempt, 0, "revival is not retry accounting");
+            assert!(book.deadline.is_none(), "pending semantics — never degrades");
+        }
+        // Cooling down: not yet a candidate.
+        assert!(pool.pick().is_none(), "the book is in cooldown");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let revived = pool.pick().expect("cooldown lapse resurfaces the pull");
+        assert_eq!(revived, pinned);
+
+        // Control: the satisfied pending's Done books nothing.
+        shared
+            .commit_state(|st| {
+                st.sessions
+                    .get_mut("satisfied")
+                    .unwrap()
+                    .satisfy_pull_pending();
+            })
+            .unwrap();
+        let done = Work::Pull {
+            sid: "satisfied".into(),
+            force_reset: false,
+        };
+        pool.finish(&done, TaskOutcome::Done);
+        assert!(!pool.books.lock().unwrap().map.contains_key("pull:satisfied:false"));
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // The revival seam's other face (amendment BLOCKING-1'): the materialize
+    // hydrate arm calls `run_pull` directly, so a `Work::Materialize` can
+    // equally end Done-with-live-pending. The check does not filter on
+    // Work type — and the re-booked payload is a PLAIN pull, never the
+    // finished work verbatim: the evict/hydrate obligation is already
+    // durable (the `materialized` commit), and re-booking the hydrate's
+    // force-reset shape would pay a whole-file reset every round.
+    #[tokio::test]
+    async fn materialize_done_with_live_pending_revives_plain_pull() {
+        let (mirror, shared) = setup("mat-revival");
+        shared
+            .commit_state(|st| {
+                st.sessions.insert(
+                    "s1".into(),
+                    SessionRecord {
+                        pull_pending: Some(state::PullPending {
+                            target: "latest".into(),
+                            enqueued_at: "t".into(),
+                        record: None,
+                        }),
+                        ..Default::default()
+                    },
+                );
+            })
+            .unwrap();
+        let pool = Pool::new(ExecCtx::new(shared.clone())).with_policy(fast_policy());
+        let hydrate = Work::Materialize {
+            name: "1-1-1.json".into(),
+            intent: Intent::Hydrate {
+                sid: "s1".into(),
+                enqueued_at: "t".into(),
+            },
+        };
+        pool.finish(&hydrate, TaskOutcome::Done);
+        assert!(
+            pool.books.lock().unwrap().map.contains_key("pull:s1:false"),
+            "hydrate-arm Done-with-live-pending re-books too"
+        );
+        let book_work = pool.books.lock().unwrap().map["pull:s1:false"].work.clone();
+        assert_eq!(
+            book_work,
+            Work::Pull {
+                sid: "s1".into(),
+                force_reset: false
+            },
+            "the residual obligation is a plain pull — never force_reset verbatim"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(pool.pick(), Some(book_work));
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // A pull/ensure-task intent aimed at a tombstone DROPS at read-in
+    // (§4.3-4①) — the eventized feed must produce nothing for it: no
+    // pending entry, no pickable work, ever.
+    #[tokio::test]
+    async fn dropped_intents_on_tombstones_feed_nothing() {
+        let (mirror, shared) = setup("tomb-feed");
+        shared
+            .commit_state(|st| {
+                st.sessions
+                    .entry("s1".into())
+                    .or_default()
+                    .bury("t", None);
+            })
+            .unwrap();
+        journal::append(
+            &shared.journal_dir,
+            &Intent::Pull {
+                sid: "s1".into(),
+                target: "latest".into(),
+                enqueued_at: "t".into(),
+            },
+        )
+        .unwrap();
+        journal::append(
+            &shared.journal_dir,
+            &Intent::EnsureTask {
+                sid: "s1".into(),
+                file: "projects/lab/s1.jsonl".into(),
+                phase: Phase::Validated,
+                enqueued_at: "t".into(),
+            },
+        )
+        .unwrap();
+        let pool = Pool::new(ExecCtx::new(shared.clone()));
+        let report = pool.drain_journal().unwrap();
+        assert_eq!(report.consumed.len(), 2);
+        assert!(
+            report
+                .consumed
+                .iter()
+                .all(|c| matches!(c.effect, Ok(journal::Effect::Dropped))),
+            "both intents drop on the tombstone"
+        );
+        assert!(
+            pool.pending.lock().unwrap().is_empty(),
+            "dropped intents enqueue nothing"
+        );
+        assert!(pool.pick().is_none(), "no candidate, ever");
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // The re-enqueue race: a pull intent consumed during the executor's
+    // end-window dedups against the still-running key — its enqueue is
+    // dropped — but its `pullPending` is already committed, so finish()'s
+    // revival seam must book the pull EXACTLY once. No path loses the
+    // candidate; no path duplicates it.
+    #[tokio::test]
+    async fn end_window_reenqueue_race_books_exactly_once() {
+        let (mirror, shared) = setup("race");
+        shared
+            .commit_state(|st| {
+                st.sessions.insert(
+                    "s1".into(),
+                    SessionRecord {
+                        pull_pending: Some(state::PullPending {
+                            target: "latest".into(),
+                            enqueued_at: "t".into(),
+                        record: None,
+                        }),
+                        ..Default::default()
+                    },
+                );
+            })
+            .unwrap();
+        let pool = Pool::new(ExecCtx::new(shared.clone())).with_policy(fast_policy());
+        pool.enqueue(Work::Pull {
+            sid: "s1".into(),
+            force_reset: false,
+        });
+        let first = pool.pick().unwrap();
+        // Mid-"execution": the new intent lands. Its drain-time enqueue
+        // dedups against the running key — by design, because finish()
+        // owns this window.
+        journal::append(
+            &shared.journal_dir,
+            &Intent::Pull {
+                sid: "s1".into(),
+                target: "latest".into(),
+                enqueued_at: "t".into(),
+            },
+        )
+        .unwrap();
+        pool.drain_journal().unwrap();
+        assert!(
+            pool.pending.lock().unwrap().is_empty(),
+            "the drain-time enqueue deduped against the running key"
+        );
+        pool.finish(&first, TaskOutcome::Done);
+        {
+            let books = pool.books.lock().unwrap();
+            assert!(
+                books.map.contains_key("pull:s1:false"),
+                "the intent is not lost — revival books it"
+            );
+            assert_eq!(books.map.len(), 1, "exactly one book survives the window");
+        }
+        assert!(pool.pending.lock().unwrap().is_empty());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let revived = pool.pick().expect("the intent is not lost");
+        assert_eq!(
+            revived,
+            Work::Pull {
+                sid: "s1".into(),
+                force_reset: false
+            }
+        );
+        assert!(pool.pick().is_none(), "no duplicate candidate");
+        std::fs::remove_dir_all(&mirror).unwrap();
     }
 }

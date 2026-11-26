@@ -15,11 +15,18 @@
 //! - `spawn_daemon` — the detached spawn every "writer missing" detector
 //!   shares (§3.2): `current_exe` re-invoked as `zonepaird`, stdin/stdout
 //!   to `/dev/null` and stderr append-logged to `<mirror>/.sync/zonepaird.log`
-//!   (one-generation rotation at 4MB, `/dev/null` fallback — the daemon's
-//!   bring-up never depends on its log opening), detached from the
-//!   spawning process so the stub's `process::exit` cannot reach it. N
-//!   concurrent spawns self-converge on the lock — the losers exit at
-//!   startup step 1, no election, no residue.
+//!   (pure append-open, `/dev/null` fallback — the daemon's bring-up
+//!   never depends on its log opening), detached from the spawning
+//!   process so the stub's `process::exit` cannot reach it. N concurrent
+//!   spawns self-converge on the lock — the losers exit at startup step
+//!   1, no election, no residue. Rotation is NOT the spawner's business:
+//!   a spawner cannot know whether its child wins the lock, and a
+//!   rename-based rotation here unlinks the winning daemon's live stderr
+//!   fd (the fd follows the inode into `.log.1`, then into nothing once
+//!   `.log.1` is overwritten). The one-generation rotation therefore
+//!   belongs to the WINNER — `rotate_stderr_log` runs in the boot
+//!   sequence after the lock settles (startup.rs), and it copies +
+//!   truncates in place so the fd's inode is never unlinked at all.
 //! - `ensure_owner` — the §3.4 probe-and-spawn: lock free → release and
 //!   spawn; lock held → `AlreadyOwned`, never spawn. `journal::append`
 //!   does not depend on the writer being alive, so a failed
@@ -39,8 +46,9 @@ pub const PID_FILE: &str = "owner.pid";
 /// The daemon's stderr capture inside `<mirror>/.sync/` — the only
 /// forensic channel a self-reborn writer has.
 pub const STDERR_LOG_FILE: &str = "zonepaird.log";
-/// Rotate `zonepaird.log` past this size at spawn time: one generation
-/// (`.log.1`) is enough for forensics — no logging framework.
+/// Rotate `zonepaird.log` past this size in the winner daemon's boot
+/// sequence: one generation (`.log.1`) is enough for forensics — no
+/// logging framework.
 pub const STDERR_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// A held owner lock: the file handle (the lock itself — dropped = lost)
@@ -162,21 +170,17 @@ fn inode_of(_file: &std::fs::File) -> Option<(u64, u64)> {
 
 /// Best-effort stderr capture for a freshly spawned daemon: append-open
 /// `<mirror>/.sync/zonepaird.log` (creating `.sync/` and the file at
-/// 0600 if absent), rotating first when the existing log passed
-/// `STDERR_LOG_MAX_BYTES` — the old log renames over `zonepaird.log.1`,
-/// one generation only. `None` on any failure: spawn falls back to
-/// `/dev/null` because bring-up must never hinge on the log opening.
+/// 0600 if absent). Pure append-open, no rotation: the spawner does not
+/// know whether its child wins the lock, and any rename here would move
+/// the winning daemon's live stderr fd into `.log.1` — the exact
+/// forensic evidence the log exists to keep. Rotation is the winner's
+/// boot-time job (`rotate_stderr_log`). `None` on any failure: spawn
+/// falls back to `/dev/null` because bring-up must never hinge on the
+/// log opening.
 fn open_stderr_log(mirror: &Path) -> Option<std::fs::File> {
     let sync = state::sync_dir(mirror);
     state::ensure_dir(&sync, 0o700).ok()?;
-    let log = sync.join(STDERR_LOG_FILE);
-    let oversized = std::fs::metadata(&log)
-        .map(|m| m.len() > STDERR_LOG_MAX_BYTES)
-        .unwrap_or(false);
-    if oversized {
-        let _ = std::fs::rename(&log, sync.join(format!("{STDERR_LOG_FILE}.1")));
-    }
-    open_log_append(&log).ok()
+    open_log_append(&sync.join(STDERR_LOG_FILE)).ok()
 }
 
 #[cfg(unix)]
@@ -195,6 +199,41 @@ fn open_log_append(path: &Path) -> std::io::Result<std::fs::File> {
         .append(true)
         .create(true)
         .open(path)
+}
+
+/// The winner daemon's one-generation rotation, run in boot after the
+/// lock settles. Copy-and-truncate, never rename: the daemon's stderr fd
+/// follows the log's inode, so renaming the file away would redirect
+/// every subsequent write into `.log.1` (and then, once `.log.1` is
+/// overwritten, into an unlinked inode — evidence silently evaporating
+/// exactly in the rebirth storms this log exists to explain). Keeping
+/// the inode in place means no fd redirection (`dup2`) is ever needed:
+/// append-mode writes land at the current end whether the file was
+/// truncated under them or not. Sole caller: `startup::boot`.
+///
+/// The sequence: over the cap → copy the full bytes through a
+/// write_atomic temp into `zonepaird.log.1` (one generation, the old
+/// `.1` replaced atomically) → truncate the live log in place and fsync
+/// it. Every failure path keeps evidence: an unreadable log or a
+/// failed copy leaves the file unrotated and appendable (it simply
+/// grows past the cap until the next boot retries); only after the
+/// copy is durable does truncation happen.
+pub fn rotate_stderr_log(sync_dir: &Path) -> Result<()> {
+    let log = sync_dir.join(STDERR_LOG_FILE);
+    let rotated = sync_dir.join(format!("{STDERR_LOG_FILE}.1"));
+    let oversized = std::fs::metadata(&log)
+        .map(|m| m.len() > STDERR_LOG_MAX_BYTES)
+        .unwrap_or(false);
+    if !oversized {
+        return Ok(());
+    }
+    let bytes = std::fs::read(&log)?;
+    let tmp = sync_dir.join(format!(".{STDERR_LOG_FILE}.1.tmp"));
+    state::write_atomic(&tmp, &rotated, &bytes)?;
+    let file = open_log_append(&log)?;
+    file.set_len(0)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 /// Try the lock without keeping it — `ensure_owner`'s probe (§3.2:
@@ -225,11 +264,12 @@ pub enum EnsureOwner {
 /// Detached spawn: re-invoke this binary as `stub-client zonepaird
 /// [--mirror <dir>]` — same argv the CLI dispatch understands, stdin and
 /// stdout to `/dev/null`, stderr append-logged to
-/// `<mirror>/.sync/zonepaird.log` when that opens (rotating one
-/// generation past 4MB), `/dev/null` when it does not (§3.2). Separated
-/// from the parent's process group so stub's `process::exit` cannot
-/// take it down. The child is deliberately un-reaped: it outlives us;
-/// the lock file, not `waitpid`, is its liveness report.
+/// `<mirror>/.sync/zonepaird.log` when that opens (pure append; the
+/// one-generation rotation past 4MB is the winner daemon's boot-time
+/// job — `rotate_stderr_log`), `/dev/null` when it does not (§3.2).
+/// Separated from the parent's process group so stub's `process::exit`
+/// cannot take it down. The child is deliberately un-reaped: it outlives
+/// us; the lock file, not `waitpid`, is its liveness report.
 pub fn spawn_daemon(mirror: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("resolving current_exe")?;
     let mut cmd = std::process::Command::new(exe);
@@ -392,58 +432,41 @@ mod tests {
         std::fs::remove_dir_all(&mirror).unwrap();
     }
 
-    // stderr capture: an oversized existing log rotates to
-    // `zonepaird.log.1` before the new file opens; anything smaller
-    // appends in place — one generation is the whole retention policy.
+    // The spawner NEVER rotates — not even an oversized log: it does not
+    // know whether its child wins the lock, and a rename here unlinks the
+    // winning daemon's live stderr inode (review Finding 1). Oversized
+    // or not, the open is a pure append.
     #[test]
-    fn stderr_log_rotates_past_the_cap_and_appends_below_it() {
-        let mirror = tmp("stderr-rotate");
+    fn stderr_log_never_rotates_and_always_appends() {
+        let mirror = tmp("stderr-no-rotate");
         let sync = state::ensure_sync_dir(&mirror).unwrap();
         let log = sync.join(STDERR_LOG_FILE);
         let rotated = sync.join(format!("{STDERR_LOG_FILE}.1"));
 
-        // Oversized: rename first, then append-open a fresh file.
+        // Oversized: the file must survive byte-identical and in place —
+        // rotation belongs to the winner daemon's boot, not to spawn.
         std::fs::write(&log, vec![b'x'; (STDERR_LOG_MAX_BYTES + 1) as usize]).unwrap();
         let f = open_stderr_log(&mirror).expect("oversized log still opens");
         assert_eq!(
-            std::fs::read(&rotated).unwrap().len() as u64,
+            log.metadata().unwrap().len(),
             STDERR_LOG_MAX_BYTES + 1,
-            "the oversized generation survives as .log.1"
+            "an oversized log is left untouched for the winner to rotate"
         );
-        assert_eq!(log.metadata().unwrap().len(), 0, "new file starts empty");
-        drop(f);
-
-        // Below the cap: no rotation, and the open is append — existing
-        // content survives what new writers add.
-        std::fs::write(&log, b"kept").unwrap();
-        std::fs::remove_file(&rotated).unwrap();
-        let mut f = open_stderr_log(&mirror).unwrap();
         assert!(
             !rotated.exists(),
-            "sub-cap log must not rotate away its evidence"
+            "spawn-side rotation is the exact regression this test pins"
         );
+        drop(f);
+
+        // Below the cap: no rotation either, and the open is append —
+        // existing content survives what new writers add.
+        std::fs::write(&log, b"kept").unwrap();
+        let mut f = open_stderr_log(&mirror).unwrap();
+        assert!(!rotated.exists());
         use std::io::Write;
         f.write_all(b"more").unwrap();
         drop(f);
         assert_eq!(std::fs::read(&log).unwrap(), b"keptmore");
-        std::fs::remove_dir_all(&mirror).unwrap();
-    }
-
-    // Rotation replaces the previous `.log.1` — only the two newest
-    // generations ever exist, no unbounded `.log.N` accretion.
-    #[test]
-    fn stderr_log_rotation_overwrites_the_older_generation() {
-        let mirror = tmp("stderr-rotate-overwrite");
-        let sync = state::ensure_sync_dir(&mirror).unwrap();
-        let log = sync.join(STDERR_LOG_FILE);
-        let rotated = sync.join(format!("{STDERR_LOG_FILE}.1"));
-        std::fs::write(&rotated, b"ancient generation").unwrap();
-        std::fs::write(&log, vec![b'y'; (STDERR_LOG_MAX_BYTES + 1) as usize]).unwrap();
-        open_stderr_log(&mirror).unwrap();
-        assert_eq!(
-            std::fs::read(&rotated).unwrap().len() as u64,
-            STDERR_LOG_MAX_BYTES + 1
-        );
         std::fs::remove_dir_all(&mirror).unwrap();
     }
 
@@ -465,19 +488,87 @@ mod tests {
         std::fs::remove_dir_all(&mirror).unwrap();
     }
 
-    // A failed rotation (`.log.1` occupied by a directory) must not lose
-    // the capture: the existing log still opens for append.
+    // The winner-side rotation: over the cap the bytes copy to
+    // `.log.1` (atomically, replacing the older generation — no `.log.N`
+    // accretion) and the live log truncates IN PLACE: same inode, so a
+    // daemon whose stderr fd already points at it keeps writing visible
+    // bytes with no fd redirection at all. `set_len` on the inode is
+    // invisible to append-mode writers — their next write lands at the
+    // new end either way.
     #[test]
-    fn stderr_log_survives_a_failed_rotation() {
-        let mirror = tmp("stderr-rotation-fails");
+    fn rotate_stderr_log_preserves_the_live_inode() {
+        let mirror = tmp("rotate-winner");
+        let sync = state::ensure_sync_dir(&mirror).unwrap();
+        let log = sync.join(STDERR_LOG_FILE);
+        let rotated = sync.join(format!("{STDERR_LOG_FILE}.1"));
+        std::fs::write(&rotated, b"ancient generation").unwrap();
+        std::fs::write(&log, vec![b'x'; (STDERR_LOG_MAX_BYTES + 1) as usize]).unwrap();
+        #[cfg(unix)]
+        let inode_before = {
+            use std::os::unix::fs::MetadataExt;
+            log.metadata().unwrap().ino()
+        };
+
+        rotate_stderr_log(&sync).unwrap();
+
+        assert_eq!(
+            std::fs::read(&rotated).unwrap().len() as u64,
+            STDERR_LOG_MAX_BYTES + 1,
+            "the oversized generation survives as .log.1, replacing the older one"
+        );
+        assert_eq!(log.metadata().unwrap().len(), 0, "live log starts over");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                log.metadata().unwrap().ino(),
+                inode_before,
+                "truncate-in-place: the fd's inode is never unlinked"
+            );
+        }
+
+        // A writer holding a pre-rotation fd — the daemon's actual
+        // posture — keeps appending visible bytes across the truncation.
+        // (Simulated with a fresh append-open: same O_APPEND semantics.)
+        use std::io::Write;
+        let mut f = open_log_append(&log).unwrap();
+        f.write_all(b"daemon lives on").unwrap();
+        drop(f);
+        assert_eq!(std::fs::read(&log).unwrap(), b"daemon lives on");
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // Sub-cap logs do not rotate; a missing log is a no-op, not an error.
+    #[test]
+    fn rotate_stderr_log_below_cap_and_absent_are_noops() {
+        let mirror = tmp("rotate-below-cap");
+        let sync = state::ensure_sync_dir(&mirror).unwrap();
+        let log = sync.join(STDERR_LOG_FILE);
+        std::fs::write(&log, b"small").unwrap();
+        rotate_stderr_log(&sync).unwrap();
+        assert_eq!(std::fs::read(&log).unwrap(), b"small");
+        assert!(!sync.join(format!("{STDERR_LOG_FILE}.1")).exists());
+        // No log at all: nothing to rotate, nothing fails.
+        rotate_stderr_log(&sync).unwrap();
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // A failed rotation (`.log.1` occupied by a directory) must not lose
+    // the capture: the copy never completes, the truncation never runs,
+    // and the oversized log survives byte-identical — evidence over
+    // tidiness, retried at the next boot.
+    #[test]
+    fn rotate_stderr_log_failure_keeps_everything() {
+        let mirror = tmp("rotate-fails");
         let sync = state::ensure_sync_dir(&mirror).unwrap();
         let log = sync.join(STDERR_LOG_FILE);
         std::fs::write(&log, vec![b'z'; (STDERR_LOG_MAX_BYTES + 1) as usize]).unwrap();
         std::fs::create_dir(sync.join(format!("{STDERR_LOG_FILE}.1"))).unwrap();
-        assert!(open_stderr_log(&mirror).is_some());
-        assert!(
-            log.metadata().unwrap().len() > STDERR_LOG_MAX_BYTES,
-            "rotation failing leaves the file in place, still appendable"
+        assert!(rotate_stderr_log(&sync).is_err());
+        assert_eq!(
+            log.metadata().unwrap().len(),
+            STDERR_LOG_MAX_BYTES + 1,
+            "a failed rotation leaves the live log byte-identical"
         );
         std::fs::remove_dir_all(&mirror).unwrap();
     }
