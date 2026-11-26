@@ -2007,14 +2007,104 @@ mod tests {
         assert!(!needs_content(Some(&tasked), &exists()));
     }
 
-    // End-to-end laziness: a steady pull session whose file is
-    // permission-unreadable still classifies row 16 Steady — the pass
-    // never opened it for content, so the read failure it would have hit
-    // cannot skip it. Under a root-run test environment the chmod is a
-    // no-op and the verdict is the same row either way, so the assertion
-    // is unconditional; what it pins is "steady pull needs no content".
+    // -- what laziness can and cannot prove behaviorally ------------------
+    //
+    // The property "a steady pull pass never reads file content" has NO
+    // behavioral signature this test suite can pin, and the honest
+    // coverage is structural: `needs_content_table_driven` pins the
+    // predicate row by row, `content_consumers_still_read_bytes` pins
+    // that real consumers DO read through the same wiring, and the two
+    // tests below pin the observable behaviors of the shapes involved.
+    // Why no stronger pin exists:
+    //
+    // 1. Verdicts cannot discriminate. For a pull-full record no row of
+    //    the §6.1 table consumes content evidence (`forked_from` needs
+    //    `no pull` — row 22; `is_stub_shell` needs `materialized=stub` —
+    //    rows 12/15; `fingerprint` needs a fileId-bound tombstone — row
+    //    0). Reading the bytes or not produces the identical verdict, so
+    //    laziness is invisible in verdict space BY DESIGN — it is a cost
+    //    property, not a correctness property.
+    // 2. Failure modes cannot discriminate either. `stat_probe`'s
+    //    open-and-drop check catches an unreadable file BEFORE the
+    //    content upgrade would run, so under any implementation — lazy
+    //    or eager — a chmod-000 file yields the identical outcome: the
+    //    sid is skipped. The chmod probe the old test used is therefore
+    //    vacuous for the property it named (and it was also broken: it
+    //    probed readability AFTER restoring permissions, making its
+    //    `!readable` branch dead code and the row-16 assertion fire on
+    //    a skip path that never emits a verdict).
+    // 3. The remaining signatures are forbidden or flaky: byte counters
+    //    in production violate the seam discipline, `/proc/self/io` is
+    //    process-wide (parallel tests corrupt it), `strace` is not
+    //    portable, and wall-clock timing is flake-prone.
+    //
+    // What CAN be pinned behaviorally, and is, below: row 16's content
+    // independence (readable environment, unconditional) and the
+    // unreadable-skip discipline for the pull shape (where the §7.2
+    // length predicate makes skipping matter most — a guessed length
+    // would truncate or re-pull real bytes).
+
+    // Row 16 classifies on record fields + stat evidence alone: a steady
+    // pull whose cursor exactly covers the file is Steady with no work
+    // queued, even when the file's CONTENT is fork-shaped — proof that
+    // no row of the classification consumed content evidence for this
+    // shape. (Content may still physically be read under a future
+    // regression of `needs_content` — invisible here by design, see the
+    // header above — but it can never change this verdict.)
     #[test]
-    fn steady_pull_session_never_reads_file_content() {
+    fn steady_pull_clean_match_row16_is_content_independent() {
+        let (mirror, sync) = setup("row16");
+        // Fork-shaped bytes: if ANY row consumed fork evidence for a
+        // pull record the verdict would leave row 16. The cursor offset
+        // equals the byte length so §7.2 is a clean match.
+        let bytes = b"{\"forkedFrom\":{\"sessionId\":\"x\"}}\n";
+        write_session(&mirror, "s1", bytes);
+        let cursor = format!("zpc1.{}.{}", bytes.len(), "0".repeat(32));
+        let mut st = State::empty_v3();
+        st.sessions.insert("s1".into(), pull_rec("s1", &cursor));
+        let report = run(
+            &mirror,
+            &sync,
+            &mut st,
+            PassKind::Steady,
+            &|_: &str| BProbe::Unknown,
+            &never_suspended,
+        )
+        .unwrap();
+        let row = report
+            .verdicts
+            .iter()
+            .find(|(s, _)| s == "s1")
+            .map(|(_, v)| v.row);
+        assert_eq!(row, Some(16), "pull-full + file → row 16: {report:?}");
+        assert!(
+            !report.work.iter().any(|w| matches!(w, Work::Pull { sid, .. } if sid == "s1")),
+            "clean length match queues no re-pull: {:?}",
+            report.work
+        );
+        assert!(
+            report.suspended.is_empty(),
+            "nothing suspends: {:?}",
+            report.suspended
+        );
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // The unreadable-skip discipline for the pull shape — the variant
+    // `unreadable_file_skips_the_sid` (task shape) does not cover: a
+    // permission-unreadable file under a pull record must produce NO
+    // verdict, NO suspension and above all NO length-predicate work —
+    // the §7.2 length judgment consumes stat `len`, and acting on it
+    // here (truncate, forced re-pull) would be exactly the destructive
+    // guess the skip exists to prevent. Where the environment cannot
+    // make the file unreadable (root — chmod is a no-op), the same
+    // pass must still classify normally, proving the skip machinery
+    // does not over-fire on readable files. The readability probe runs
+    // BEFORE the permission restore: probing afterwards is meaningless
+    // (the old test's dead `!readable` branch — it read as always-true
+    // and steered CI onto the wrong assertion).
+    #[test]
+    fn unreadable_pull_file_skips_without_length_work() {
         let (mirror, sync) = setup("lazy");
         let file = write_session(&mirror, "s1", b"1234567");
         let mut st = State::empty_v3();
@@ -2023,6 +2113,7 @@ mod tests {
             pull_rec("s1", "zpc1.7.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
         );
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::File::open(&file).is_ok();
         let report = run(
             &mirror,
             &sync,
@@ -2033,30 +2124,44 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let readable = std::fs::File::open(&file).is_ok();
         if !readable {
-            // Content truly unreadable: the stat probe caught the open
-            // failure — so either the sid is skipped (unreadable) or it
-            // classified row 16 on stat evidence. The ONE thing that must
-            // never happen is a verdict depending on content it could
-            // not have read — and row 16/§7.2 is exactly the len-only
-            // consumer: cursor covers all 7 bytes, a clean match.
+            // The stat-phase open-check caught it: skipped, never guessed.
+            assert!(
+                !report.verdicts.iter().any(|(s, _)| s == "s1"),
+                "an unreadable file emits no verdict: {:?}",
+                report.verdicts
+            );
+            assert!(
+                !report.work.iter().any(|w| matches!(w, Work::Pull { sid, .. } if sid == "s1")),
+                "no length-predicate re-pull on an unreadable file: {:?}",
+                report.work
+            );
+            assert!(
+                report.suspended.is_empty(),
+                "a transient IO failure is not a suspension: {:?}",
+                report.suspended
+            );
+            assert!(
+                report.notes.iter().any(|n| n.contains("unreadable")),
+                "the skip is logged: {:?}",
+                report.notes
+            );
+            assert!(
+                st.sessions["s1"].pull.is_some() && st.sessions["s1"].deleted.is_none(),
+                "the record is untouched — no tombstone, no mutation"
+            );
+        } else {
+            // Root (or a permission-less fs): unreadable is unreachable —
+            // assert the environment-probe neutral form instead: the sid
+            // still classifies row 16, proving the skip never fires on a
+            // file that CAN be opened. Content-independence itself is
+            // pinned unconditionally by the row16 test above.
             let row = report
                 .verdicts
                 .iter()
                 .find(|(s, _)| s == "s1")
                 .map(|(_, v)| v.row);
-            assert!(
-                row == Some(16) || row.is_none(),
-                "steady pull must classify without content: {row:?} / {:?}",
-                report.notes
-            );
-        } else {
-            // Root or ACL-less fs: assert the verdict content-neutrally.
-            assert!(report
-                .verdicts
-                .iter()
-                .any(|(s, v)| s == "s1" && v.row == 16));
+            assert_eq!(row, Some(16), "readable file classifies normally");
         }
         std::fs::remove_dir_all(&mirror).unwrap();
     }
