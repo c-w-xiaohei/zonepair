@@ -2,10 +2,12 @@
 //! multi-writer point (RFC-0003-zonepaird §4). Any short-lived process appends one
 //! record `<unix_ms>-<pid>-<seq>.json` through the five-step write
 //! (`create_new *.tmp` → write → file fsync → **rename to final name** →
-//! dir fsync); the sole writer consumes them in filename order, committing
-//! each record into `state.json` *before* deleting the journal file
-//! (commit-then-delete — the reverse pair would lose a consumed intent to
-//! a crash landing in between).
+//! dir fsync); the sole writer consumes them in filename order. Since D2
+//! (cd-state-cpu spec §4.3) consumption is BATCHED: all records apply in
+//! filename order, ONE durable commit covers the batch, and only then are
+//! the consumable record files deleted — strictly in consume order
+//! (commit-then-delete at batch granularity; a crash inside the deletion
+//! window leaves a suffix whose replay converges idempotently, §4.3-3).
 //!
 //! `*.tmp` files are never consumed: a crash leaves "created, half-written"
 //! residue that startup cleanup reclaims. Anything that is neither a
@@ -646,10 +648,17 @@ pub(crate) struct Consumed {
 }
 
 /// Consume the channel (sole writer only): read in filename order, apply
-/// each record, commit state, THEN delete the file — commit-then-delete
-/// (§4.3-1). Returns the per-entry effects; entries whose effect needs
-/// out-of-transaction work (`RunReconcile`/`Deferred`) are *not*
-/// deleted and are reported so the caller executes them, then deletes.
+/// each record, then — cd-state-cpu spec §4.3 — ONE batch commit covers
+/// the whole batch, after which non-deferred record files are deleted
+/// strictly in consume order. Commit-then-delete (§4.3-1) holds at batch
+/// granularity: a crash inside the deletion window leaves a SUFFIX of
+/// the batch on disk, replay is idempotent (§4.3-3), and the provenance
+/// guard converges to the same final state — the deletion order is what
+/// makes the survivors a suffix, so deletion is a single ordered pass
+/// with no reorderable API surface (NB-1).
+///
+/// Deferred records (`RunReconcile`/`Deferred`) are never deleted here —
+/// their deletion timing is §4.3-4③'s (the executor's commit), unchanged.
 ///
 /// `tombstone_fp` computes the `deleted.fileId` for `note-remote-delete`:
 /// the caller supplies a probe closure (record → fingerprint or `None`),
@@ -676,6 +685,12 @@ pub(crate) fn consume_ordered_parked(
 ) -> Result<Vec<Consumed>> {
     let (entries, _debris) = read_pending(dir)?;
     let mut out = Vec::with_capacity(entries.len());
+    let mut first_sighting = false;
+    // Pass 1 — apply in consume order, collect. No commits, no deletes:
+    // the batch commit below is the batch's single transaction, and any
+    // first-sighting apply triggers it (spec §4.3: even one yielding
+    // Dropped or Deferred — evict's §4.3-4② pullPending clear rides the
+    // same batch, replacing the old per-record durable arm).
     for entry in entries {
         match entry.record {
             Err(e) => {
@@ -710,33 +725,7 @@ pub(crate) fn consume_ordered_parked(
                     None
                 };
                 let effect = apply(state, &intent, fp, &entry.name);
-                let deferred =
-                    matches!(effect, Effect::RunReconcile | Effect::Deferred);
-                if deferred {
-                    // §4.3-4② durable arm: `evict` clears `pullPending`
-                    // IN ITS READ-IN TRANSACTION — the in-memory clear
-                    // `apply` just did must land on disk now. The
-                    // journal's own order is the ordering authority: a
-                    // pull intent enqueued after this evict reads in
-                    // later and lands a fresh `pullPending` (which
-                    // survives), while anything queued before it is
-                    // already wiped. No timestamp comparison can express
-                    // that order — RFC3339 has only second resolution.
-                    // The record file itself is NOT deleted — execution
-                    // and its `materialized` commit still come first
-                    // (§4.3-4③).
-                    if matches!(intent, Intent::Evict { .. }) {
-                        state::commit(sync_dir, state)?;
-                    }
-                } else {
-                    // Commit-then-delete: crash between the two replays
-                    // idempotently instead of losing the intent.
-                    state::commit(sync_dir, state)?;
-                    std::fs::remove_file(dir.join(&entry.name)).with_context(|| {
-                        format!("deleting consumed journal record {}", entry.name)
-                    })?;
-                    fsync_dir(dir)?;
-                }
+                first_sighting = true;
                 out.push(Consumed {
                     name: entry.name,
                     intent: Some(intent),
@@ -744,6 +733,51 @@ pub(crate) fn consume_ordered_parked(
                 });
             }
         }
+    }
+    if !first_sighting {
+        // Pure parked re-emits (and unparseable debris) mutate nothing
+        // and delete nothing — no commit at all (spec §4.3's
+        // "非纯重放 apply" trigger read backwards).
+        return Ok(out);
+    }
+    // Pass 2 — the batch's ONE durable commit. The caller holds the
+    // state lock across this whole consume (pool.rs's frozen shape), so
+    // the writer thread cannot serialize for us: the batch is serialized
+    // inside this hold and handed to the writer as finished bytes, which
+    // is the only deadlock-free shape the frozen interface admits. The
+    // ack wait IS lock-held — unavoidable under the freeze — but the
+    // writer never needs the state lock for byte work, so the wait is
+    // bounded by one write's IO. Laneless contexts (unit tests) write
+    // directly: no writer exists, so nothing races.
+    match state::lookup_lane(sync_dir) {
+        Some(lane) => {
+            let gen = lane.bump();
+            let bytes = state::serialize(state)?;
+            lane.enqueue_bytes(gen, bytes);
+            lane.wait_durable(gen)?;
+        }
+        None => state::commit(sync_dir, state)?,
+    }
+    // Pass 3 — delete the consumable records strictly in consume order.
+    // Out-of-order deletion is structurally impossible: this loop is the
+    // only deletion point, it iterates `out` (which `apply` built in
+    // filename order), and no reordering parameter exists (NB-1).
+    let mut deleted = 0;
+    for entry in &out {
+        let deletable = matches!(
+            entry.effect,
+            Ok(Effect::Applied) | Ok(Effect::Dropped)
+        );
+        if !deletable {
+            continue;
+        }
+        std::fs::remove_file(dir.join(&entry.name)).with_context(|| {
+            format!("deleting consumed journal record {}", entry.name)
+        })?;
+        deleted += 1;
+    }
+    if deleted > 0 {
+        fsync_dir(dir)?;
     }
     Ok(out)
 }
@@ -1539,6 +1573,258 @@ mod tests {
             "op":"ensure-task","kind":"publish","sid":"s",
             "file":"/etc/passwd","phase":"validated","enqueuedAt":"t"
         })).is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // D2 batch-consume tests (cd-state-cpu spec §4.3/§4.6): these drive
+    // `consume_ordered_parked` with a live commit lane — minted directly
+    // (the lane is persist-layer machinery, no engine dependency) — so
+    // the bytes enqueue + lock-held ack wait run exactly as production's
+    // `drain_journal` shape. The laneless fallback is covered by every
+    // pre-D2 test above.
+    // ---------------------------------------------------------------
+
+    struct LaneFixture {
+        mirror: PathBuf,
+        sync: PathBuf,
+        journal: PathBuf,
+        state: std::sync::Arc<std::sync::Mutex<State>>,
+        lane: std::sync::Arc<state::CommitLane>,
+    }
+
+    impl LaneFixture {
+        fn new(name: &str) -> Self {
+            let mirror = tmp("journal-batch", name);
+            let sync = state::ensure_sync_dir(&mirror).unwrap();
+            let journal = sync.join("journal");
+            ensure_dir(&journal, 0o700).unwrap();
+            let state = std::sync::Arc::new(std::sync::Mutex::new(State::empty_v3()));
+            let lane = state::CommitLane::spawn(&sync, std::sync::Arc::clone(&state));
+            state::register_lane(&sync, &lane);
+            Self { mirror, sync, journal, state, lane }
+        }
+
+        /// Production shape: consume under the state lock the same way
+        /// `pool::drain_journal` does.
+        fn consume(&self, parked: &std::collections::HashSet<String>) -> Result<Vec<Consumed>> {
+            let mut guard = self.state.lock().unwrap();
+            consume_ordered_parked(&self.journal, &self.sync, &mut guard, no_fp, parked)
+        }
+
+        fn writes(&self) -> u64 {
+            self.lane.write_count()
+        }
+
+        fn seed(&self, sid: &str, rec: SessionRecord) {
+            self.state.lock().unwrap().sessions.insert(sid.into(), rec);
+        }
+    }
+
+    impl Drop for LaneFixture {
+        fn drop(&mut self) {
+            // Wake the writer so the thread exits instead of parking on
+            // the lane the test is dropping.
+            self.lane.shutdown();
+            let _ = std::fs::remove_dir_all(&self.mirror);
+        }
+    }
+
+    fn pulled(sid: &str) -> SessionRecord {
+        SessionRecord {
+            pull: Some(state::Pull {
+                cursor: "zpc1.7.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                file: format!("projects/lab/{sid}.jsonl"),
+            }),
+            ..SessionRecord::default()
+        }
+    }
+
+    // N records → exactly ONE physical write. Deterministic by
+    // construction: the consume acks before returning, so by the time
+    // the count is read every byte work of the batch has completed, and
+    // no other committer exists in the test.
+    #[test]
+    fn batch_consume_commits_once_for_n_records() {
+        let fx = LaneFixture::new("batch-once");
+        for (i, op) in [
+            json!({"op":"register","sid":"s1","kind":"b-owned","enqueuedAt":"t"}),
+            json!({"op":"pull","sid":"s1","target":"latest","enqueuedAt":"t"}),
+            json!({"op":"pull","sid":"s2","target":"latest","enqueuedAt":"t"}),
+            json!({"op":"note-remote-delete","sid":"s2","enqueuedAt":"t"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            write_intent(&fx.journal, &format!("{}-1-1.json", i + 1), op);
+        }
+        let before = fx.writes();
+        let consumed = fx.consume(&Default::default()).unwrap();
+        assert_eq!(consumed.len(), 4);
+        let delta = fx.writes() - before;
+        assert_eq!(delta, 1, "one batch = one physical write, got {delta}");
+        // Every consumable record is deleted, the durable state carries
+        // all four intents.
+        assert!(pending_count(&fx.journal) == 0);
+        let disk = state::load(&fx.sync).unwrap();
+        assert!(disk.state.sessions["s1"].pull_pending.is_some());
+        assert!(disk.state.sessions["s2"].deleted.is_some());
+    }
+
+    // A purely-parked batch commits NOTHING: no first-sighting apply
+    // means no mutation to persist and nothing to delete.
+    #[test]
+    fn pure_parked_batch_commits_nothing() {
+        let fx = LaneFixture::new("batch-parked");
+        fx.seed("s1", pulled("s1"));
+        write_intent(
+            &fx.journal,
+            "1-1-1.json",
+            json!({"op":"evict","sid":"s1","mode":"drop","enqueuedAt":"t"}),
+        );
+        // First drain: the evict is a first sighting → one commit.
+        fx.consume(&Default::default()).unwrap();
+        let before = fx.writes();
+        // Re-drain with the record parked: re-emit only, zero commits.
+        let parked: std::collections::HashSet<String> =
+            ["1-1-1.json".to_string()].into_iter().collect();
+        let consumed = fx.consume(&parked).unwrap();
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(consumed[0].effect, Ok(Effect::Deferred));
+        assert_eq!(fx.writes() - before, 0, "parked re-emits must not commit");
+    }
+
+    // Commit-then-delete at batch granularity: a failing write means NO
+    // record is deleted — the batch replays next drain (§4.3-1).
+    #[test]
+    fn failed_batch_commit_deletes_nothing() {
+        let fx = LaneFixture::new("batch-fail");
+        write_intent(
+            &fx.journal,
+            "1-1-1.json",
+            json!({"op":"pull","sid":"s1","target":"latest","enqueuedAt":"t"}),
+        );
+        std::fs::create_dir(state::state_path(&fx.sync)).unwrap();
+        let err = fx.consume(&Default::default()).unwrap_err();
+        assert!(format!("{err:#}").contains("state write failed"), "{err:#}");
+        assert!(
+            fx.journal.join("1-1-1.json").exists(),
+            "a failed batch commit must not delete records"
+        );
+        // Repair: the replay converges — apply is idempotent, the pull
+        // intent was already applied in memory and is now durable.
+        std::fs::remove_dir(state::state_path(&fx.sync)).unwrap();
+        let consumed = fx.consume(&Default::default()).unwrap();
+        assert_eq!(consumed.len(), 1);
+        assert!(!fx.journal.join("1-1-1.json").exists());
+        let disk = state::load(&fx.sync).unwrap();
+        assert!(disk.state.sessions["s1"].pull_pending.is_some());
+    }
+
+    // Crash-injection, NB-1's provenance counterexample pinned (spec
+    // §4.6 专项回归钉): batch pull1 → evict2 → pull3 commits as one,
+    // the process "dies" before ANY deletion (the crash window's worst
+    // corner: the whole batch replays). After replay, the final state
+    // must converge to the committed batch state — pull3's post-evict
+    // pending survives because its replay re-stamps `pullPending.record`
+    // forward BEFORE evict2's replayed predates check runs. (The ordered
+    // deletion pass is what guarantees any REAL crash window leaves only
+    // a suffix; this test exercises the superset corner.)
+    #[test]
+    fn crash_before_deletion_replays_to_batch_state() {
+        let fx = LaneFixture::new("crash-suffix");
+        fx.seed("s1", pulled("s1"));
+        write_intent(
+            &fx.journal,
+            "1-1-1.json",
+            json!({"op":"pull","sid":"s1","target":"zpc1.5.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","enqueuedAt":"t"}),
+        );
+        write_intent(
+            &fx.journal,
+            "2-1-1.json",
+            json!({"op":"evict","sid":"s1","mode":"drop","enqueuedAt":"t"}),
+        );
+        write_intent(
+            &fx.journal,
+            "3-1-1.json",
+            json!({"op":"pull","sid":"s1","target":"latest","enqueuedAt":"t"}),
+        );
+        // Drain 1: evict2 defers (clears pull1's pending by provenance),
+        // pull3 re-stamps. The batch commit lands; in the real run the
+        // non-deferred records would now delete — the crash intercedes.
+        let consumed = fx.consume(&Default::default()).unwrap();
+        assert_eq!(consumed[0].effect, Ok(Effect::Applied), "pull1");
+        assert_eq!(consumed[1].effect, Ok(Effect::Deferred), "evict2");
+        assert_eq!(consumed[2].effect, Ok(Effect::Applied), "pull3");
+        // The crash: every consumable record is back on disk (as if the
+        // deletion pass never ran) and in-memory state is dropped,
+        // reloading only what the batch committed. Boot-time truth: the
+        // parked set is empty, so evict2 re-applies on the replay.
+        for (name, body) in [
+            ("1-1-1.json", json!({"op":"pull","sid":"s1","target":"zpc1.5.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","enqueuedAt":"t"})),
+            ("3-1-1.json", json!({"op":"pull","sid":"s1","target":"latest","enqueuedAt":"t"})),
+        ] {
+            if !fx.journal.join(name).exists() {
+                write_intent(&fx.journal, name, body);
+            }
+        }
+        let mut reloaded = state::load(&fx.sync).unwrap().state;
+        let consumed = consume_ordered_parked(
+            &fx.journal,
+            &fx.sync,
+            &mut reloaded,
+            no_fp,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(consumed.len(), 3);
+        let pending = reloaded.sessions["s1"].pull_pending.as_ref().unwrap();
+        assert_eq!(
+            pending.record.as_deref(),
+            Some("3-1-1.json"),
+            "pull3's stamp must survive the replay — the predates guard \
+             reads the re-forwarded stamp, not a stale pull1 stamp"
+        );
+        assert_eq!(pending.target, "latest");
+        // And the durable state after replay commits the same shape.
+        let disk = state::load(&fx.sync).unwrap();
+        assert_eq!(
+            disk.state.sessions["s1"]
+                .pull_pending
+                .as_ref()
+                .and_then(|p| p.record.as_deref()),
+            Some("3-1-1.json")
+        );
+    }
+
+    // Deletion order is consume order, single point: a mixed batch
+    // (deferred + consumable interleaved) deletes every consumable
+    // record and only those — the deferred record is §4.3-4③'s.
+    #[test]
+    fn batch_deletes_only_consumable_records() {
+        let fx = LaneFixture::new("batch-mixed");
+        fx.seed("s1", pulled("s1"));
+        write_intent(
+            &fx.journal,
+            "1-1-1.json",
+            json!({"op":"pull","sid":"s2","target":"latest","enqueuedAt":"t"}),
+        );
+        write_intent(
+            &fx.journal,
+            "2-1-1.json",
+            json!({"op":"evict","sid":"s1","mode":"drop","enqueuedAt":"t"}),
+        );
+        write_intent(
+            &fx.journal,
+            "3-1-1.json",
+            json!({"op":"pull","sid":"s3","target":"latest","enqueuedAt":"t"}),
+        );
+        fx.consume(&Default::default()).unwrap();
+        assert!(!fx.journal.join("1-1-1.json").exists());
+        assert!(
+            fx.journal.join("2-1-1.json").exists(),
+            "deferred records are never deleted by the consume pass"
+        );
+        assert!(!fx.journal.join("3-1-1.json").exists());
     }
 
     // Debris cleanup skips non-regular entries — a directory inside

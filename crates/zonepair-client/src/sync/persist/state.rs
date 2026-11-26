@@ -9,10 +9,12 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 pub(crate) const VERSION: u32 = 3;
 const STATE_FILE: &str = "state.json";
@@ -396,17 +398,380 @@ fn load_impl(sync_dir: &Path, writable: bool) -> Result<LoadOutcome> {
 /// fsync → atomic rename → directory fsync. The transaction unit IS one
 /// file write; multi-field updates (e.g. `phase=published` + `publishedAt`
 /// + `pull`) land atomically because they are one `State`.
+///
+/// D2 (cd-state-cpu spec §4): the wire format is now **compact** JSON
+/// (`to_vec`, not `to_vec_pretty`) — pretty-printing was never an RFC
+/// contract and every reader in the tree parses the file as JSON. This
+/// direct-call form remains for lane-less contexts (unit tests, the
+/// reconcile test seam) and as the consume path's laneless fallback;
+/// production commits funnel through `CommitLane`'s writer thread.
 pub fn commit(sync_dir: &Path, state: &State) -> Result<()> {
     ensure_dir(sync_dir, 0o700)?;
+    let bytes = serialize(state)?;
+    write_bytes(sync_dir, &bytes)
+}
+
+/// The wire bytes for one table — compact JSON. The writer thread
+/// serializes under a short state lock; the consume path serializes
+/// inside the lock it already holds. Both share this one body so the
+/// format decision lives in exactly one place.
+pub(crate) fn serialize(state: &State) -> Result<Vec<u8>> {
     let wire = Wire {
         version: VERSION,
         sessions: &state.sessions,
     };
-    let bytes = serde_json::to_vec_pretty(&wire).context("serializing state.json")?;
+    serde_json::to_vec(&wire).context("serializing state.json")
+}
+
+/// The writer thread's execution body for already-serialized bytes:
+/// temp write → fsync → rename → dir fsync (one transaction, §3.1).
+pub(crate) fn write_bytes(sync_dir: &Path, bytes: &[u8]) -> Result<()> {
+    ensure_dir(sync_dir, 0o700)?;
     let tmp = sync_dir.join(".state.json.tmp");
     let target = state_path(sync_dir);
-    write_atomic(&tmp, &target, &bytes)
+    write_atomic(&tmp, &target, bytes)
         .with_context(|| format!("committing {}", target.display()))
+}
+
+// ------------------------------------------------- the commit lane (D2) ---
+//
+// cd-state-cpu spec §4.2: a single writer thread per sync dir is the ONLY
+// writer of `state.json` in production. Callers mutate in-memory state
+// under the state lock, bump a generation counter atomically with the
+// mutation, and hand ordering tokens — never bytes — to the lane; the
+// writer coalesces everything durable-behind-issued into one serialize +
+// write. `commit_state` waits (condvar) until durable ≥ its generation;
+// `commit_state_lazy` returns after the bump.
+//
+// Two shapes of work reach the writer:
+//
+// - **serialize work** (implicit): `attempted < issued` means some
+//   committer bumped since the last try (NOT `durable` — a failed write
+//   must idle until a newer generation arrives, never hot-loop); the
+//   writer try_locks the state mutex, serializes inside that short hold
+//   (spec §4.2: ~5-10 ms at the pre-reap table size), writes.
+// - **bytes work** (the consume path): `drain_journal` holds the state
+//   lock across the whole consume (pool.rs's frozen shape), so the batch
+//   commit cannot be serialized by the writer — it would deadlock. The
+//   consume path serializes the batch inside its own hold and enqueues
+//   finished bytes; the writer only performs the IO. The writer never
+//   blocks on the state lock while byte work is outstanding, which is
+//   what keeps the consume path's ack wait deadlock-free despite the lock
+//   being held across it.
+//
+// Generation labels are ordering tokens, not content claims beyond this
+// invariant: bytes labelled G contain every mutation whose generation is
+// < G. Writer-side serialization reads the label INSIDE the state lock,
+// so a write labelled G always covers every generation ≤ G. Consume-side
+// bumps happen inside the consume's own lock hold, so no committer's
+// mutation can interleave uncounted.
+
+/// One `(generation, bytes)` unit of byte work.
+struct ByteWork {
+    gen: u64,
+    bytes: Vec<u8>,
+}
+
+/// The lane's lock-protected coordination state. Lock ordering rule:
+/// `state` may be held while `coord` is taken (consume path), but `coord`
+/// is NEVER held while the state mutex is acquired — the writer takes the
+/// state mutex (try_lock) only with empty hands.
+struct Coord {
+    /// Highest generation whose bytes are durably on disk.
+    durable: u64,
+    /// Highest generation a write was TRIED for. The writer's serialize
+    /// trigger is `attempted < issued`, not `durable < issued` — a failed
+    /// write must not hot-loop: it is retried only when a newer
+    /// generation arrives (whose content covers everything lost).
+    attempted: u64,
+    /// Byte work waiting for IO, ordered by generation.
+    queue: VecDeque<ByteWork>,
+    /// `(generation, message)` of the most recent failed write, cleared
+    /// by the next success. A waiter fails fast only when the failure's
+    /// generation covers its own.
+    failure: Option<(u64, String)>,
+    /// Dropped-owner latch: the writer finishes outstanding work and
+    /// exits. Set by `Shared`'s Drop so test processes do not leak one
+    /// parked thread per mirror.
+    shutdown: bool,
+    /// Total physical writes performed — the coalescing/batch evidence
+    /// tests count.
+    writes: u64,
+}
+
+/// Test seam (cd-state-cpu spec §4.6's "fake writer"): a hook invoked
+/// once per physical write, before the IO. Production lanes never
+/// install one.
+type WriteHook = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
+/// The per-sync-dir write lane: generation counter, work queue, ack
+/// state, and the state mutex the writer serializes under. Owned by
+/// `Shared` (strongly), indexed by canonicalized sync dir in a process-
+/// wide registry of weak references so the frozen consume interface —
+/// which receives `sync_dir` but not the `Shared` — can find it.
+pub struct CommitLane {
+    sync_dir: PathBuf,
+    state: Arc<Mutex<State>>,
+    /// Generations handed out. `fetch_add` ordering makes a bump atomic
+    /// with the mutation it follows because both happen inside the same
+    /// state-lock hold.
+    issued: AtomicU64,
+    coord: Mutex<Coord>,
+    cv: Condvar,
+    hook: Mutex<Option<WriteHook>>,
+}
+
+impl CommitLane {
+    /// Mint a lane and spawn its writer thread. The thread holds only a
+    /// weak lane reference, so the lane (and the thread) die with their
+    /// owning `Shared`.
+    pub(crate) fn spawn(sync_dir: &Path, state: Arc<Mutex<State>>) -> Arc<CommitLane> {
+        let lane = Arc::new(CommitLane {
+            sync_dir: sync_dir.to_path_buf(),
+            state,
+            issued: AtomicU64::new(0),
+            coord: Mutex::new(Coord {
+                durable: 0,
+                attempted: 0,
+                queue: VecDeque::new(),
+                failure: None,
+                shutdown: false,
+                writes: 0,
+            }),
+            cv: Condvar::new(),
+            hook: Mutex::new(None),
+        });
+        let weak = Arc::downgrade(&lane);
+        std::thread::Builder::new()
+            .name("zp-state-writer".into())
+            .spawn(move || writer_loop(weak))
+            .expect("spawn zp-state-writer");
+        lane
+    }
+
+    /// Hand out the next generation. Callers MUST invoke this inside the
+    /// state-lock hold that carried the mutation — the atomicity of
+    /// mutation+bump is what makes generations ordering tokens.
+    pub(crate) fn bump(&self) -> u64 {
+        self.issued.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Wake the writer so it notices the generation counter moved.
+    /// The predicate lives inside `coord`, so taking the lock around the
+    /// notify is the correct-ordering half of the condvar protocol.
+    pub(crate) fn poke(&self) {
+        let _guard = self.coord.lock().unwrap();
+        self.cv.notify_one();
+    }
+
+    /// Enqueue already-serialized bytes (the consume path's batch
+    /// commit). The writer performs only the IO.
+    pub(crate) fn enqueue_bytes(&self, gen: u64, bytes: Vec<u8>) {
+        {
+            let mut guard = self.coord.lock().unwrap();
+            guard.queue.push_back(ByteWork { gen, bytes });
+        }
+        self.cv.notify_one();
+    }
+
+    /// Block until generation `gen` is durable on disk, or the write
+    /// covering it is known to have failed. Callers must not hold the
+    /// state lock UNLESS the write they await is byte work (the consume
+    /// path) — serialize work needs that same lock, and waiting on it
+    /// while holding it deadlocks by construction.
+    pub(crate) fn wait_durable(&self, gen: u64) -> Result<()> {
+        let mut guard = self.coord.lock().unwrap();
+        loop {
+            if guard.durable >= gen {
+                return Ok(());
+            }
+            if let Some((fgen, message)) = &guard.failure {
+                if *fgen >= gen {
+                    return Err(anyhow::anyhow!("state write failed: {message}"));
+                }
+            }
+            guard = self.cv.wait(guard).unwrap();
+        }
+    }
+
+    /// Test introspection: physical writes so far (coalescing/batch
+    /// counting), and the injected fault/delay hook.
+    #[cfg(test)]
+    pub(crate) fn write_count(&self) -> u64 {
+        self.coord.lock().unwrap().writes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_write_hook(&self, hook: Option<WriteHook>) {
+        *self.hook.lock().unwrap() = hook;
+        self.cv.notify_one();
+    }
+
+    /// The shutdown half of `Shared`'s Drop: the writer drains any
+    /// outstanding work and exits instead of parking forever.
+    pub(crate) fn shutdown(&self) {
+        {
+            let mut guard = self.coord.lock().unwrap();
+            guard.shutdown = true;
+        }
+        self.cv.notify_one();
+    }
+}
+
+/// The writer thread loop. Nothing here ever blocks on the state mutex
+/// while byte work is outstanding: byte work is drained first, and the
+/// serialize step uses `try_lock` — a busy state mutex almost always
+/// means the consume path is mid-batch and will shortly enqueue byte
+/// work, so the loop re-checks the queue between retries. This ordering
+/// is what makes the consume path's lock-held ack wait deadlock-free.
+fn writer_loop(weak: Weak<CommitLane>) {
+    loop {
+        let Some(lane) = weak.upgrade() else {
+            return;
+        };
+        // Drain byte work first — it never needs the state lock.
+        while let Some(work) = {
+            let mut guard = lane.coord.lock().unwrap();
+            guard.queue.pop_front()
+        } {
+            lane.write_out(work.gen, work.bytes);
+        }
+        // Serialize work: attempted behind issued means committers bumped
+        // since the last try. (Not `durable`: a failed write must idle
+        // until a NEWER generation arrives, never hot-loop.)
+        let needs_write = {
+            let guard = lane.coord.lock().unwrap();
+            guard.attempted < lane.issued.load(Ordering::SeqCst)
+        };
+        if needs_write {
+            match lane.state.try_lock() {
+                Ok(guard) => {
+                    // The label is read INSIDE the lock: bytes serialized
+                    // now cover every mutation ≤ label by construction.
+                    let label = lane.issued.load(Ordering::SeqCst);
+                    let bytes = serialize(&guard);
+                    drop(guard);
+                    match bytes {
+                        Ok(bytes) => lane.write_out(label, bytes),
+                        Err(e) => lane.write_failed(label, format!("serializing: {e:#}")),
+                    }
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    // The state mutex is busy — most often the consume
+                    // path mid-batch, which will deliver byte work.
+                    // Re-check the queue rather than spinning on the lock.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    // A committer panicked mid-mutation; the process is
+                    // already in the spec's "writer panic = process
+                    // fault" territory. Park rather than spin.
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+            continue;
+        }
+        // Nothing to do: park. The shutdown latch is part of the
+        // predicate so a dying owner cannot strand the thread. Shutdown
+        // exits only once outstanding work is drained or tried — a batch
+        // commit already acked nowhere must not be abandoned mid-flight
+        // while its consumer still waits.
+        let mut guard = lane.coord.lock().unwrap();
+        loop {
+            let drained = guard.queue.is_empty()
+                && guard.attempted >= lane.issued.load(Ordering::SeqCst);
+            if guard.shutdown && drained {
+                return;
+            }
+            if !drained {
+                break;
+            }
+            guard = lane.cv.wait(guard).unwrap();
+        }
+    }
+}
+
+impl CommitLane {
+    /// Perform one physical write and publish the ack. Writes are
+    /// strictly serialized on this single thread and generation labels
+    /// order with content, so a stale label (durable already past it)
+    /// can only mean the content is already covered — skip the IO.
+    fn write_out(&self, gen: u64, bytes: Vec<u8>) {
+        {
+            let mut guard = self.coord.lock().unwrap();
+            if guard.durable >= gen {
+                return;
+            }
+            guard.attempted = guard.attempted.max(gen);
+        }
+        let result = (|| {
+            if let Some(hook) = self.hook.lock().unwrap().clone() {
+                hook()?;
+            }
+            write_bytes(&self.sync_dir, &bytes)
+        })();
+        let mut guard = self.coord.lock().unwrap();
+        match result {
+            Ok(()) => {
+                guard.durable = guard.durable.max(gen);
+                guard.writes += 1;
+                guard.failure = None;
+            }
+            Err(e) => {
+                guard.failure = Some((gen, format!("{e:#}")));
+            }
+        }
+        drop(guard);
+        self.cv.notify_all();
+    }
+
+    /// A failure that never reached the IO stage (serialization error).
+    fn write_failed(&self, gen: u64, message: String) {
+        {
+            let mut guard = self.coord.lock().unwrap();
+            guard.attempted = guard.attempted.max(gen);
+            guard.failure = Some((gen, message));
+        }
+        self.cv.notify_all();
+    }
+}
+
+/// The consume path's only discovery channel: the frozen
+/// `consume_journal` interface hands the journal layer a `sync_dir` but
+/// never the `Shared` it came from, so lanes are indexed by canonical
+/// sync dir in a process-wide table of weak references. `Shared::open`
+/// registers its lane (replacing any stale entry for the same dir);
+/// `open_readonly` never does — a read-only process is not a writer and
+/// must not claim the dir's write lane.
+fn lane_registry() -> &'static Mutex<HashMap<PathBuf, Weak<CommitLane>>> {
+    static REGISTRY: std::sync::OnceLock<Mutex<HashMap<PathBuf, Weak<CommitLane>>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Canonicalization normalizes symlinked spellings of the same dir; a
+/// path that cannot be canonicalized (not yet created) keys as-is.
+fn lane_key(sync_dir: &Path) -> PathBuf {
+    std::fs::canonicalize(sync_dir).unwrap_or_else(|_| sync_dir.to_path_buf())
+}
+
+pub(crate) fn register_lane(sync_dir: &Path, lane: &Arc<CommitLane>) {
+    lane_registry()
+        .lock()
+        .unwrap()
+        .insert(lane_key(sync_dir), Arc::downgrade(lane));
+}
+
+/// The lane for `sync_dir`, if a live `Shared::open` owns one in this
+/// process. `None` means no writer exists here (unit tests on bare
+/// tables, read-only processes) — callers fall back to direct writes,
+/// which is race-free exactly because there is no writer to race.
+pub(crate) fn lookup_lane(sync_dir: &Path) -> Option<Arc<CommitLane>> {
+    lane_registry()
+        .lock()
+        .unwrap()
+        .get(&lane_key(sync_dir))
+        .and_then(Weak::upgrade)
 }
 
 // --------------------------------------------------------- parse/validate ---
@@ -671,6 +1036,28 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(state_path(&sync)).unwrap()).unwrap();
         assert_eq!(parsed["sessions"], json!({}));
         std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // D2 (cd-state-cpu spec §4.2): the wire format is compact JSON —
+    // `to_vec`, not `to_vec_pretty`. Pretty-printing was never an RFC
+    // contract and every reader parses as JSON; this pins both the
+    // compactness (no pretty whitespace) and the round-trip.
+    #[test]
+    fn commit_writes_compact_json() {
+        let dir = tmp("state", "compact");
+        ensure_dir(&dir, 0o700).unwrap();
+        let mut state = State::empty_v3();
+        state.sessions.insert("s1".into(), full_record());
+        commit(&dir, &state).unwrap();
+        let raw = std::fs::read(state_path(&dir)).unwrap();
+        assert!(
+            !raw.windows(2).any(|w| w == b"\n "),
+            "compact serialization carries no pretty indentation"
+        );
+        assert_eq!(raw.iter().filter(|b| **b == b'\n').count(), 0);
+        let loaded = load(&dir).unwrap();
+        assert_eq!(loaded.state, state, "compact round-trips verbatim");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     // T-413: version recognition set is exactly {2,3} — absent / string /

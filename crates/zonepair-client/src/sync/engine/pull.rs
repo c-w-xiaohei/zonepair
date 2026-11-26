@@ -94,7 +94,23 @@ pub async fn run_pull(ctx: &ExecCtx, sid: &str, force_reset: bool) -> TaskOutcom
                         return TaskOutcome::Retry(format!("touch {}: {e}", file.display()));
                     }
                 }
-                if let Err(e) = ctx.shared.commit_state(|st| {
+                // The unchanged convergence commit (cd-state-cpu spec
+                // §4.3): durable when it carries semantics — the hydrate
+                // path's `materialized` return (NB-2 convergence class) or
+                // a `pullPending` satisfaction (`latest` is satisfied by
+                // the unchanged verdict itself, §9's `sync --wait`
+                // contract); lazy when it only refreshes the
+                // `lastUnchangedAt` observation field and lands the
+                // idempotent zero-cursor first pull — both crash-loss-safe
+                // by replay.
+                let durable = hydrate
+                    || ctx.shared.with_state(|st| {
+                        st.sessions
+                            .get(sid)
+                            .and_then(|r| r.pull_pending.as_ref())
+                            .is_some_and(|pp| pp.target == "latest")
+                    });
+                let commit = |st: &mut crate::sync::persist::state::State| {
                     let rec = st.sessions.entry(sid.to_string()).or_default();
                     if rec.deleted.is_some() {
                         return;
@@ -123,7 +139,13 @@ pub async fn run_pull(ctx: &ExecCtx, sid: &str, force_reset: bool) -> TaskOutcom
                     if pending_satisfied(rec, true) {
                         rec.satisfy_pull_pending();
                     }
-                }) {
+                };
+                let outcome = if durable {
+                    ctx.shared.commit_state(commit)
+                } else {
+                    ctx.shared.commit_state_lazy(commit)
+                };
+                if let Err(e) = outcome {
                     return TaskOutcome::Retry(format!("commit unchanged: {e:#}"));
                 }
                 ctx.shared.notify.signal(sid);
@@ -200,8 +222,19 @@ pub async fn run_pull(ctx: &ExecCtx, sid: &str, force_reset: bool) -> TaskOutcom
 /// return (§4.5 hydrate sequence); `registered` clears through
 /// `begin_pull`; `pullPending` is satisfied same-transaction when its
 /// target was reached (§9 contract for `sync --wait`).
+///
+/// Durability split (cd-state-cpu spec §4.3): a pure cursor-advance cell
+/// is LAZY — the write-order rule constrains sequencing (the bytes are
+/// already fsync'd inside `apply`, before this commit is even enqueued),
+/// not frequency, and a crash losing the last window costs one
+/// idempotent re-pull. Durable when the cell carries semantics: the
+/// hydrate path's first cell (`materialized=full` same-transaction —
+/// NB-2 classifies it with the convergence points, not the middle
+/// cells), or a cell satisfying the session's `pullPending` — the same
+/// §9 `sync --wait` contract that keeps the unchanged commit durable.
 fn commit_pull(ctx: &ExecCtx, sid: &str, next_cursor: &str, rel: &str, hydrate: bool) -> Result<()> {
-    ctx.shared.commit_state(|st| {
+    let durable = hydrate || would_satisfy(ctx, sid, next_cursor);
+    let commit = |st: &mut crate::sync::persist::state::State| {
         let rec = st.sessions.entry(sid.to_string()).or_default();
         if rec.deleted.is_some() {
             return; // tombstone committed mid-pull — never resurrect
@@ -216,9 +249,39 @@ fn commit_pull(ctx: &ExecCtx, sid: &str, next_cursor: &str, rel: &str, hydrate: 
         if pending_satisfied(rec, false) {
             rec.satisfy_pull_pending();
         }
-    })?;
+    };
+    if durable {
+        ctx.shared.commit_state(commit)?;
+    } else {
+        ctx.shared.commit_state_lazy(commit)?;
+    }
     ctx.shared.notify.signal(sid);
     Ok(())
+}
+
+/// Would committing cursor `next_cursor` satisfy this session's
+/// `pullPending`? The durability decision needs the answer BEFORE the
+/// commit — a downgrade race is impossible (a pullPending can only be
+/// consumed or re-stamped forward; either way over-durability is the
+/// worst outcome, never under-).
+fn would_satisfy(ctx: &ExecCtx, sid: &str, next_cursor: &str) -> bool {
+    ctx.shared.with_state(|st| {
+        let Some(rec) = st.sessions.get(sid) else {
+            return false;
+        };
+        let Some(pp) = &rec.pull_pending else {
+            return false;
+        };
+        if pp.target == "latest" {
+            return false; // `latest` is satisfied by the unchanged verdict
+        }
+        let Ok(target) = cursor::parse(&pp.target) else {
+            return false;
+        };
+        cursor::parse(next_cursor)
+            .map(|c| c.prefix_hash == target.prefix_hash && c.offset >= target.offset)
+            .unwrap_or(false)
+    })
 }
 
 /// `pullPending` satisfaction (§3.3 + §9): `latest` is satisfied by an
@@ -860,6 +923,104 @@ mod tests {
         assert_eq!(outcome, TaskOutcome::Done);
         assert!(lines(&seen).is_empty());
         let _ = server;
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // cd-state-cpu spec §4.3 — the durability decision behind
+    // `commit_pull`'s lazy/durable split: a pinned target is satisfied
+    // (→ durable) exactly when the next cursor reaches its byte count
+    // with a matching fingerprint; `latest` never satisfies on a cell
+    // (it is satisfied by the unchanged verdict — the unchanged commit
+    // carries its own durable decision). Consistency with
+    // `pending_satisfied`'s semantics is the point of the pin.
+    #[tokio::test]
+    async fn would_satisfy_mirrors_pending_satisfied_pinned_rule() {
+        let (mirror, shared) = setup("wouldsat");
+        let fp = "a".repeat(32);
+        let other_fp = "b".repeat(32);
+        let seed = |target: String| {
+            let shared = shared.clone();
+            shared.commit_state(move |st| {
+                st.sessions.insert(
+                    "s1".into(),
+                    SessionRecord {
+                        pull_pending: Some(state::PullPending {
+                            target,
+                            enqueued_at: "t".into(),
+                            record: None,
+                        }),
+                        ..Default::default()
+                    },
+                );
+            })
+        };
+        let cur = |off: u64, fp: &str| format!("zpc1.{off}.{fp}");
+        let ctx = ExecCtx::new(shared.clone());
+
+        // Pinned target: reached (offset ≥, same fp) → satisfied.
+        seed(cur(500, &fp)).unwrap();
+        assert!(would_satisfy(&ctx, "s1", &cur(500, &fp)));
+        assert!(would_satisfy(&ctx, "s1", &cur(900, &fp)));
+        // Short of the byte count, or a mismatched fingerprint → not.
+        assert!(!would_satisfy(&ctx, "s1", &cur(499, &fp)));
+        assert!(!would_satisfy(&ctx, "s1", &cur(900, &other_fp)));
+        // `latest`: a cell NEVER satisfies it — the unchanged verdict does.
+        seed("latest".into()).unwrap();
+        assert!(
+            !would_satisfy(&ctx, "s1", &cur(999999, &fp)),
+            "latest is satisfied by the unchanged verdict, not a cell"
+        );
+        // No pending at all → nothing to satisfy → lazy.
+        shared
+            .commit_state(|st| {
+                st.sessions.insert("s2".into(), SessionRecord::default());
+            })
+            .unwrap();
+        assert!(!would_satisfy(&ctx, "s2", &cur(100, &fp)));
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // The unchanged convergence commit stays durable when it consumes a
+    // `latest` pullPending (§9 `sync --wait` contract): the moment the
+    // pull returns, the satisfied pending is readable from DISK — the
+    // writer-thread ack, not just the in-memory mutation.
+    #[tokio::test]
+    async fn unchanged_convergence_is_durable_on_disk() {
+        let c1 = "zpc1.3.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let script = vec![
+            vec![Scripted::Reply(http_octets("append", c1, b"one"))],
+            vec![Scripted::Reply(http_json(
+                200,
+                &json!({"ok": true, "state": "unchanged", "nextCursor": c1}).to_string(),
+            ))],
+        ];
+        let (base, seen, server) = serve_script(script).await;
+        let (mirror, shared) = setup("conv-durable");
+        shared
+            .commit_state(|st| {
+                st.sessions.insert(
+                    "s1".into(),
+                    SessionRecord {
+                        pull_pending: Some(state::PullPending {
+                            target: "latest".into(),
+                            enqueued_at: "t".into(),
+                            record: None,
+                        }),
+                        ..Default::default()
+                    },
+                );
+            })
+            .unwrap();
+        let ctx = ctx_with(&base, &shared);
+        let outcome = run_pull(&ctx, "s1", false).await;
+        assert_eq!(outcome, TaskOutcome::Done);
+        let disk = crate::sync::persist::state::load(&shared.sync_dir).unwrap();
+        assert!(
+            disk.state.sessions["s1"].pull_pending.is_none(),
+            "pullPending satisfaction must be durable when the pull returns"
+        );
+        assert!(disk.state.sessions["s1"].last_unchanged_at.is_some());
+        finish_server(server, &seen).await;
         std::fs::remove_dir_all(&mirror).unwrap();
     }
 
