@@ -114,8 +114,19 @@ pub trait SessionReap: SessionStore {
     /// shape (`pull_pending` present, every other field absent) inside
     /// the same lock hold as the removal — a record that picked up real
     /// fields between the verdict and the commit (a concurrent journal
-    /// drain landing register/pull traffic) is not a zombie anymore, and
-    /// deleting it would silently drop the resurrected intent.
+    /// drain landing a register or task intent) is not a zombie anymore,
+    /// and deleting it would silently drop the resurrected intent.
+    ///
+    /// Honest limit of the guard: a fresh *pull* intent does NOT trip
+    /// it — `merge_pull_pending` only rewrites `pull_pending` itself, so
+    /// the record still satisfies every conjunct and is deleted with the
+    /// new intent inside. That loss is accepted, not overlooked: the
+    /// shape requires B answering 404 within the same pass that traffic
+    /// attests a live session, a contradiction inside RFC's single-A
+    /// model (spec §3.2.2) — it can only arise from out-of-model writes
+    /// (a second machine A′ sharing the store), which RFC-0002 §6.3's
+    /// revival-channel note already classifies as needing a mechanism of
+    /// their own.
     fn reap_commit(&mut self, sync_dir: &Path, sids: &[String]) -> Result<Vec<String>>;
 }
 
@@ -535,9 +546,14 @@ pub fn run<S: SessionReap>(
         // pool enqueues without journal involvement (the §9.1-7 replay
         // path, T-634). A sid the pass just condemned to reap is
         // excluded: its pending dies with the record.
+        // `deleted` joins the guard as defense-in-depth: bury clears
+        // the pending in the same transaction, so a tombstoned record
+        // carrying one is production-unreachable — but with the state
+        // scan gone this requeue is the pending's only revive channel,
+        // and it must never resurrect work for the buried.
         if store
             .get(&sid)
-            .is_some_and(|r| r.pull_pending.is_some())
+            .is_some_and(|r| r.pull_pending.is_some() && r.deleted.is_none())
             && !report.suspended.contains(&sid)
             && verdict.action != Action::Reap
         {
