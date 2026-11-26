@@ -353,6 +353,8 @@ Each step corresponds to the crash point it prevents:
 
 Compares the two sides `mirror × sessions`; the scan set is limited to exact-name `<sid>.jsonl` under `projects/**`, excluding `*.zp*`. **Rule order is fixed: tombstone filter first (RFC 0002 §5), then joint judgment (RFC 0002 §6.1's complete table)** — the disposition column's execution surface (delete-again/suspend/backfill `registered`/register `task(writing)`/first-pull build `pull`) is implemented by this document; classification semantics themselves defer to RFC 0002. Length-predicate partitioning (startup truncation vs steady-state bidirectional degraded) defers to RFC 0002 §7.2. **Local file deletion after tombstone read-in is backstopped by this executor**: between tombstone commit and actual deletion there is at most one reconciliation period — the tombstone first suppresses all rebuild/pull/resume, the file itself is then cleaned by "should-be-deleted but still present → delete once more"; in this window the file is present but semantically dead.
 
+**Crash-window precision note**: the "one-record-wide" crash window this executor's atomicity arguments rely on guards the *destructive execution surface* — file deletion, truncation, byte writes. A pure record mutation with no execution surface of its own (RFC 0002 §6.1 row 27's zombie reaping: erasing the record *is* the entire action) is licensed to batch many records into one commit: a crash mid-batch merely reaps fewer zombies this round, and the survivors classify identically next pass. The licence does not extend to any verdict that touches files.
+
 ### 9.3 Coverage boundary
 
 | Event | Coverage |
