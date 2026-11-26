@@ -796,6 +796,13 @@ impl Pool {
                 }
                 book.attempt += 1;
                 if book.deadline.is_some_and(|d| Instant::now() >= d) {
+                    // Degrade is terminal — the book has no reason to
+                    // survive (same shape as the Degraded arm below).
+                    // Leaving it in the map would weld the key shut: its
+                    // heap entry was consumed at dispatch, so pick()'s
+                    // at-expiry cleanup can never reach it while
+                    // enqueue()'s dedup sees it forever.
+                    books.map.remove(&key);
                     drop(books);
                     self.degrade_work(work, &reason);
                     return;
@@ -1687,6 +1694,54 @@ mod tests {
             }
         );
         assert!(pool.pick().is_none(), "no duplicate candidate");
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // Regression pin — review Finding 1 (the zombie book): a retry book
+    // whose deadline is exceeded at finish() time — the execution's own
+    // wall-clock overran the budget's remainder, the production shape of
+    // a long pull/publish finishing Retry past its account — degrades
+    // and must LEAVE the map. Pre-fix the expired branch returned early
+    // with the book still in `books.map`: unreachable for pick()'s
+    // at-expiry cleanup (its heap entry was consumed at dispatch, and
+    // nothing re-pushes one) yet present for enqueue()'s dedup — the
+    // key's scheduling channel welded shut until process restart (the
+    // reconcile key's form: whole-mirror passes silently stop). The pin:
+    // degrade is terminal, the map is clean, the key accepts fresh work.
+    #[tokio::test]
+    async fn finish_retry_past_deadline_degrades_and_frees_the_key() {
+        let (mirror, shared) = setup("finish-expiry");
+        let pool = Pool::new(ExecCtx::new(shared.clone())).with_policy(fast_policy());
+        let work = Work::Pull {
+            sid: "s1".into(),
+            force_reset: false,
+        };
+        // First Retry: booked with a 5ms budget deadline, not yet expired.
+        pool.finish(&work, TaskOutcome::Retry("transient".into()));
+        assert!(pool.books.lock().unwrap().map.contains_key("pull:s1:false"));
+        // The execution window overruns the budget — the next finish()
+        // hits the expired-deadline branch.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        pool.finish(&work, TaskOutcome::Retry("transient".into()));
+        assert!(
+            !pool.books.lock().unwrap().map.contains_key("pull:s1:false"),
+            "degrade is terminal — no zombie book may survive it"
+        );
+        assert!(
+            pool.is_suspended("s1"),
+            "the expired book degrades through the pull overlay"
+        );
+        // The key is free: a fresh intent's enqueue must not be absorbed
+        // by dedup — §6.3's "recovery's only path = a new intent" reopens.
+        pool.enqueue(work.clone());
+        assert!(
+            pool.pending
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, w)| w.key() == work.key()),
+            "same-key enqueue after the degrade must not be dedup-rejected"
+        );
         std::fs::remove_dir_all(&mirror).unwrap();
     }
 }

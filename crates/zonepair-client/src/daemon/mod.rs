@@ -664,7 +664,7 @@ mod tests {
         // Both intents consumed → pullPending on both; s9's pull record
         // also made it active → E4 can enqueue Pull{s9}. The pending
         // pool state: s9 pick should offer a pull; s8's pullPending
-        // resurfaces through the state scan anyway — the assertion is
+        // resurfaces through the drain's eventized feed anyway — the assertion is
         // journal drained + state updated.
         for _ in 0..200 {
             let done = shared.with_state(|st| {
@@ -686,7 +686,7 @@ mod tests {
                 .get("s9")
                 .is_some_and(|r| r.pull_pending.is_some())
         }));
-        // The pool picked s9's pull work (state scan) — prove the loop
+        // The pool picked s9's pull work (eventized enqueue) — prove the loop
         // dispatched: running or books or pending holds at least one.
         assert!(journal::pending_count(&shared.journal_dir) == 0);
         std::fs::write(sync.join(STOP_FILE), b"stop").unwrap();

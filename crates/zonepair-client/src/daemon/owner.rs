@@ -218,6 +218,15 @@ fn open_log_append(path: &Path) -> std::io::Result<std::fs::File> {
 /// failed copy leaves the file unrotated and appendable (it simply
 /// grows past the cap until the next boot retries); only after the
 /// copy is durable does truncation happen.
+///
+/// The happy path pays one bounded loss window, stated honestly: bytes
+/// a concurrent writer appends between the snapshot read and the
+/// truncate are dropped — they entered neither the copy (already read)
+/// nor the truncated log. The window is one 4MB-class read+write
+/// (millisecond-scale) and the only possible writer is a dying
+/// generation's final concurrent lines; the alternative — rename —
+/// costs the live inode, the exact evidence loss this design exists to
+/// prevent. Accepted price, not a defect.
 pub fn rotate_stderr_log(sync_dir: &Path) -> Result<()> {
     let log = sync_dir.join(STDERR_LOG_FILE);
     let rotated = sync_dir.join(format!("{STDERR_LOG_FILE}.1"));
@@ -548,8 +557,13 @@ mod tests {
         rotate_stderr_log(&sync).unwrap();
         assert_eq!(std::fs::read(&log).unwrap(), b"small");
         assert!(!sync.join(format!("{STDERR_LOG_FILE}.1")).exists());
-        // No log at all: nothing to rotate, nothing fails.
+        // No log at all — the absent arm. Without this delete the second
+        // call re-exercised the below-cap arm and the `metadata`-fails
+        // early return had zero coverage (review Finding 3).
+        std::fs::remove_file(&log).unwrap();
         rotate_stderr_log(&sync).unwrap();
+        assert!(!log.exists(), "an absent log is a no-op, not a creation");
+        assert!(!sync.join(format!("{STDERR_LOG_FILE}.1")).exists());
         std::fs::remove_dir_all(&mirror).unwrap();
     }
 
