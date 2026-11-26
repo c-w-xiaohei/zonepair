@@ -28,7 +28,14 @@
 //! |   | wide crash window does not forbid the batch) |
 //!
 //! The scan set is `projects/**/<sid>.jsonl`, `*.zp*` temp residue
-//! excluded. State IO goes through the `SessionStore` seam so a pass can
+//! excluded — scanned ONCE per pass (§5.1), serving both the E7 union
+//! and every unbound sid's path resolution. File evidence is two-tier
+//! (§5.2): `exists`/`len` by stat for every sid, content reads only for
+//! the three verdict inputs that consume them. B evidence is gathered
+//! in bounded-parallel lanes (§5.3) between the serial snapshot and the
+//! serial classify/execute phases — classification stays a pure function
+//! of snapshots, concurrency only reorders evidence collection. State IO
+//! goes through the `SessionStore` seam so a pass can
 //! commit one record at a time under whatever lock discipline the caller
 //! keeps (`State` directly, or the pool's `Arc<Shared>`); B probes come in
 //! through a `&dyn Fn(&str) -> BProbe` seam (production = `store_exists`,
@@ -41,6 +48,7 @@
 //! reach the tombstone).
 
 use anyhow::Result;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -255,13 +263,20 @@ pub fn tombstone_file_id(
     file.fingerprint.clone()
 }
 
-/// Probe one session file on disk. `file_rel` is the record's `task.file`
+/// Probe one session file on disk — the FULL content probe: every byte
+/// read, every content field filled. `file_rel` is the record's `task.file`
 /// or `pull.file` mirror-relative path when present — the record binds the
 /// landing spot (§3.3, "same-name ambiguity"); otherwise the `projects/**` first-hit
 /// scan. Read errors NEVER degrade to `absent()` — an unreadable file
 /// marked `unreadable` and the caller skips the sid this round, because
 /// the absence edges it would fire are destructive (a transient EACCES
 /// during a sweep could tombstone a live publish task).
+///
+/// `reconcile::run` does NOT ride this function: a pass's evidence needs
+/// content only for the shapes its consumers demand, so it probes through
+/// `stat_probe` + conditional content upgrade instead. This full probe
+/// stays for the one-off consumers (wait re-derivation, transport, pool
+/// read-ins) where the read pays for exactly one verdict.
 pub fn probe_session_file(
     mirror: &Path,
     file_rel: Option<&str>,
@@ -284,6 +299,259 @@ pub fn probe_session_file(
     }
 }
 
+/// The pass-local probe builder: resolve a candidate path WITHOUT reading
+/// content. `exists`/`len` come from metadata (stat); the readability
+/// check opens the file and drops the handle — it pays one syscall, not
+/// the bytes, and it must happen here rather than inside the content
+/// upgrade: a sid whose content never gets read would otherwise never
+/// learn the file is unreadable, and the old full-read probe taught the
+/// whole pass to skip it (every absence edge it would feed is
+/// destructive). An open failure is `unreadable` exactly as a read
+/// failure is.
+fn stat_probe(path: Option<PathBuf>) -> (FileProbe, Option<PathBuf>) {
+    match path {
+        Some(p) => match std::fs::metadata(&p) {
+            Ok(m) if m.is_file() => {
+                if std::fs::File::open(&p).is_err() {
+                    let mut probe = FileProbe::absent();
+                    probe.exists = true;
+                    probe.unreadable = true;
+                    (probe, Some(p))
+                } else {
+                    let probe = FileProbe {
+                        exists: true,
+                        len: m.len(),
+                        ..FileProbe::absent()
+                    };
+                    (probe, Some(p))
+                }
+            }
+            _ => (FileProbe::absent(), Some(p)),
+        },
+        _ => (FileProbe::absent(), path),
+    }
+}
+
+/// §5.2's content-read prerequisites — `true` only for the three verdict
+/// inputs that can actually consume content evidence. Steady passes
+/// pay zero content reads for the 99% shape (pull ∧ full ∧ file): their
+/// length predicate wants `len`, not bytes.
+///
+/// 1. **tombstone `fileId` comparison** (tombstone filter, row 0): only a
+///    record tombstoned with a non-null `fileId` compares fingerprints —
+///    a null `fileId` seals the sid unconditionally and reads nothing.
+/// 2. **the fork judgment** (`file.forked_from`): row 22's predicate is
+///    `file ∧ forkedFrom ∧ no pull/task/registered/publishedAt` — and it
+///    does NOT exclude `pullPending`, `deleted` or `materialized`. That
+///    negative conjunct set is therefore the exact prerequisite: any
+///    record free of those four fields can hit row 22 on fork evidence
+///    (a zombie with a dropped fork file classifies WritingHold, a
+///    mismatched-instance tombstone likewise), so the bytes must be read
+///    whenever they exist. Row 24's `no_record_fields` shapes are a
+///    strict subset of the same conjunct — the union collapses into
+///    row 22's condition alone.
+/// 3. **rows 12/15 stub-shell recognition** (`file.is_stub_shell`): only
+///    `materialized == stub` ever consults the shell marker.
+///
+/// `unreadable` probes are excluded up front: their content cannot be
+/// taken, and the pass skips the sid before classify regardless.
+fn needs_content(rec: Option<&SessionRecord>, probe: &FileProbe) -> bool {
+    if !probe.exists || probe.unreadable {
+        return false;
+    }
+    // 1. the tombstone fileId comparison.
+    if rec
+        .and_then(|r| r.deleted.as_ref())
+        .is_some_and(|d| d.file_id.is_some())
+    {
+        return true;
+    }
+    // 3. rows 12/15's stub-shell recognition.
+    if rec.is_some_and(|r| r.materialized == Some(state::Materialized::Stub)) {
+        return true;
+    }
+    // 2. the fork judgment — exactly row 22's negative conjunct set;
+    //    `rec` absent satisfies all of it (the empty-record defaults).
+    //    One exclusion sharpens it: a SEALED tombstone (fileId null)
+    //    hits the row-0 filter unconditionally — the table never runs,
+    //    so even a fork-shaped file under it has no consumer. (A
+    //    fileId-bound tombstone reads through arm 1 regardless.)
+    match rec {
+        None => true,
+        Some(r) => {
+            let sealed = r
+                .deleted
+                .as_ref()
+                .is_some_and(|d| d.file_id.is_none());
+            !sealed
+                && r.pull.is_none()
+                && r.task.is_none()
+                && r.registered.is_none()
+                && r.published_at.is_none()
+        }
+    }
+}
+
+/// Upgrade a stat probe with content evidence: read the file, fill the
+/// content fields. `len` comes from the bytes read (not the earlier
+/// stat): for content-consuming verdicts the probe must stay the same
+/// coherent byte-view the old full-read probe produced. A mid-pass read
+/// failure races the stat-phase readability check — the evidence cannot
+/// be taken, so the probe goes `unreadable` and the sid is skipped, the
+/// exact verdict the old upfront-read probe reached (stat `len` would be
+/// a torn half-evidence, and absence edges fed by it are destructive).
+fn read_content(probe: &mut FileProbe, path: &Path) {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let full = FileProbe::from_bytes(&bytes);
+            probe.len = full.len;
+            probe.fingerprint = full.fingerprint;
+            probe.forked_from = full.forked_from;
+            probe.is_stub_shell = full.is_stub_shell;
+            probe.unreadable = false;
+        }
+        Err(_) => {
+            probe.fingerprint = None;
+            probe.forked_from = false;
+            probe.is_stub_shell = false;
+            probe.unreadable = true;
+        }
+    }
+}
+
+/// The conservative superset deciding whether a sid's verdict can depend
+/// on B at all. `false` means NO row the shape can hit reads the probe —
+/// the sid classifies on `BProbe::Unknown` and the verdict is byte-for-
+/// byte what an answered probe would produce, so the probe is not paid.
+///
+/// Derivation over the §6.1 table, row family by row family:
+///
+/// - **task rows 1–5** never read `b`: every phase of `task` hits rows
+///   1–5 under first-match BEFORE any later row — a `task`-carrying
+///   record is probe-independent even with `pull` alongside (rows 1–5
+///   shadow the pull rows). The predicate does NOT special-case this
+///   (a `task ∧ pull` record still satisfies the `pull` conjunct) —
+///   harmless over-probe, no verdict difference.
+/// - **pull rows 7/8/12/13/14/16** read `b != BProbe::Absent` — they are
+///   `needs_b: false` and fire under `Unknown`/`Present` alike, but
+///   `Absent` diverts the same shape to row 18 (pull ∧ B 404), which is
+///   `needs_b`. Any `pull` record therefore can depend on the probe.
+/// - **rows 19/20/21** (`registered ∧ no pull`) are `needs_b` outright.
+/// - **row 11** (`publishedAt ∧ file`) and **row 18** are `needs_b`; both
+///   are reachable only with `pull` in practice (row 9 covers
+///   `publishedAt ∧ no pull ∧ file` probe-independently) — `publishedAt`
+///   stays in the conjunct regardless: the spec's conservative superset,
+///   at near-zero cost.
+/// - **row 24** (`no fields ∧ file`) is `needs_b`. The forked-file arm
+///   of the same shape hits row 22 probe-independently — but which row
+///   applies is content evidence, not available at pre-screen time, so
+///   the shape probes.
+/// - **row 27** (the zombie reap) is `needs_b`: a `pullPending`-only
+///   record with no file MUST probe — otherwise the reap never fires and
+///   the zombie lives forever (row-27 regression).
+/// - **row 23** (`no record`) is `needs_b` unconditionally.
+/// - Tombstoned records (`deleted` present, bury cleared everything
+///   else): row 0's suppress is probe-independent, and the post-filter
+///   remainder is an all-fields-absent record — `file` absent or
+///   `forked_from` uncertain at pre-screen, but `no_record_fields` is
+///   FALSE for it (`deleted` is a field), so rows 22/24/26 cannot hit;
+///   nothing probe-dependent remains. The conjuncts below answer `false`
+///   for it naturally.
+fn needs_b_probe(rec: Option<&SessionRecord>, file_exists: bool) -> bool {
+    let Some(r) = rec else {
+        // Row 23 (needs_b) is reachable the moment B answers Present.
+        return true;
+    };
+    if r.pull.is_some() || r.registered.is_some() || r.published_at.is_some() {
+        return true;
+    }
+    if r.pull_pending.is_some() {
+        // Row 27 candidate (or over-probe for `pullPending ∧ file`, which
+        // cannot reap — cheap, conservative).
+        return true;
+    }
+    // Row 24 candidate: a fieldless record with a file on disk.
+    file_exists
+        && r.task.is_none()
+        && r.deleted.is_none()
+        && r.materialized.is_none()
+}
+
+/// Bounded concurrency for phase-two probing — a compile-time constant by
+/// design (spec §5.3: not a config knob, YAGNI). 16 lanes cover the
+/// RTT-dominated probe cost; the evidence fans out per lane and every
+/// lane's work is independent IO.
+const PROBE_LANES: usize = 16;
+
+/// Phase two of the pass: probe the pre-screened sids with bounded
+/// concurrency. `std::thread::scope` — zero new dependencies, the threads
+/// join before the function returns, so no probe outlives the pass. The
+/// lanes are contiguous chunks of the target list: single-probe latency
+/// is RTT-uniform, so a fair partition costs nothing a work-stealing
+/// queue would earn back. `targets` empty or `len == 1` never spawns a
+/// thread — the serial fallback keeps single-sid passes free of thread
+/// machinery.
+///
+/// Every synchronous probe WAIT (the single-probe fast path as much as
+/// the lane join) is a long block on the calling thread: on a multi-
+/// thread tokio runtime it must ride `block_in_place` so the worker
+/// yields its core and the runtime keeps driving the probes' IO —
+/// otherwise a small runtime (a single free worker) deadlocks exactly
+/// the way the serial probe never could: the pass thread waits on lane
+/// join, the lanes wait on reactor progress, and the reactor waits on
+/// the pass thread. `block_in_place` panics on a `current_thread`
+/// runtime, so the wrap is flavor-gated; outside a runtime (sync tests)
+/// it is a plain call anyway. This coupling is intentional: reconcile
+/// stays generic and tokio-free for evidence semantics, and the one
+/// tokio-aware line is confined to the fan-out mechanics, which are
+/// precisely what the runtime interacts with.
+fn probe_parallel(
+    sids: &[String],
+    b_probe: &(dyn Fn(&str) -> BProbe + Send + Sync),
+) -> HashMap<String, BProbe> {
+    use std::sync::mpsc::channel;
+    let mut out = HashMap::new();
+    if sids.is_empty() {
+        return out;
+    }
+    let on_multi_thread = tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    fn run_blocking<F: FnOnce() -> R, R>(on_multi_thread: bool, f: F) -> R {
+        if on_multi_thread {
+            tokio::task::block_in_place(f)
+        } else {
+            f()
+        }
+    }
+    if sids.len() == 1 {
+        let b = run_blocking(on_multi_thread, || b_probe(&sids[0]));
+        out.insert(sids[0].clone(), b);
+        return out;
+    }
+    let lanes = PROBE_LANES.min(sids.len());
+    let width = sids.len().div_ceil(lanes);
+    let (tx, rx) = channel::<(String, BProbe)>();
+    run_blocking(on_multi_thread, || {
+        std::thread::scope(|s| {
+            for chunk in sids.chunks(width) {
+                let tx = tx.clone();
+                s.spawn(move || {
+                    for sid in chunk {
+                        let _ = tx.send((sid.clone(), b_probe(sid)));
+                    }
+                });
+            }
+        });
+    });
+    // Every lane clone is dead after the join — drop our own sender so the
+    // drain terminates.
+    drop(tx);
+    for (sid, b) in rx {
+        out.insert(sid, b);
+    }
+    out
+}
+
 /// First `<sid>.jsonl` hit anywhere under `projects/**` (arbitrary depth —
 /// same search rule as the SDK's find). The scan itself is
 /// `fs::scan_session_files`.
@@ -297,22 +565,55 @@ pub fn session_file(mirror: &Path, sid: &str) -> Option<PathBuf> {
     hits.into_iter().next()
 }
 
-/// Run one reconciliation pass. `store` supplies the record table and
-/// takes one commit per mutation — no cross-session batching: the crash
-/// window must never widen beyond the record being settled. The single
-/// licensed exception is row 27's reap batch: pure record deletion with
-/// no execution surface, committed once at pass end (RFC-0002 §6.3).
+/// The phase-one snapshot: one sid's cloned record, file evidence, and
+/// the path it was taken at — everything classification consumes. The
+/// record clone is deliberately the same `store.get` snapshot the old
+/// serial pass classified: stale-snapshot guards inside the mutation
+/// arms re-validate at commit time exactly as before.
+struct Snapshot {
+    rec: Option<SessionRecord>,
+    probe: FileProbe,
+    path: Option<PathBuf>,
+}
+
+/// Run one reconciliation pass, three phases (spec §5.1–§5.3):
+///
+/// ```text
+/// phase 1 (serial, cheap):  clone each record, resolve its file path
+///                           through ONE mirror scan, stat the file,
+///                           read content ONLY for the three verdict
+///                           inputs that consume it (§5.2) — and decide
+///                           whether the verdict can depend on B at all.
+/// phase 2 (parallel):       probe B for exactly those sids, bounded to
+///                           16 lanes (PROBE_LANES) — the boot-time
+///                           serial ~10000 × RTT cost collapses into
+///                           lanes. RFC compatibility: classification is
+///                           a pure function of (rec, file, B) snapshots,
+///                           so concurrency changes only the ORDER the
+///                           evidence is sampled in, never a verdict.
+///                           Unknown answers skip the round unchanged.
+/// phase 3 (serial):         per-sid classify + verdict execution,
+///                           verbatim the pre-D4 loop body.
+/// ```
+///
+/// `store` supplies the record table and takes one commit per mutation —
+/// no cross-session batching: the crash window must never widen beyond
+/// the record being settled. The single licensed exception is row 27's
+/// reap batch: pure record deletion with no execution surface, committed
+/// once at pass end (RFC-0002 §6.3).
 ///
 /// `b_probe` answers "does B still hold this session" per sid; verdicts
 /// that need it and get `BProbe::Unknown` skip the round (§6 preamble) —
-/// this function never guesses. `previously_suspended` lets the caller
-/// (the pool's runtime overlay) report which sids recovered.
+/// this function never guesses. Sids the pre-screen proves probe-
+/// independent classify on `Unknown` without the probe being paid at all
+/// (their verdict cannot read it). `previously_suspended` lets the
+/// caller (the pool's runtime overlay) report which sids recovered.
 pub fn run<S: SessionReap>(
     mirror: &Path,
     sync_dir: &Path,
     store: &mut S,
     kind: PassKind,
-    b_probe: &dyn Fn(&str) -> BProbe,
+    b_probe: &(dyn Fn(&str) -> BProbe + Send + Sync),
     previously_suspended: &dyn Fn(&str) -> bool,
 ) -> Result<ReconcileReport> {
     let mut report = ReconcileReport::default();
@@ -325,13 +626,28 @@ pub fn run<S: SessionReap>(
     // The session set is mirror ∪ records: E7's appearance edge supplies
     // sids the record table has never seen; disappearance is covered by
     // records whose file is gone.
+    //
+    // §5.1 — the scan happens ONCE: `scan_session_files` already walks the
+    // whole tree for the E7 union, and its first-hit-per-sid ordering is
+    // byte-for-byte the resolution `session_file()` used to re-derive per
+    // sid (a full tree scan each, O(M×F) across the pass). The map keeps
+    // borrowed references: the scan vector outlives both phases.
+    let scan = scan_session_files(mirror);
+    let scan_map: HashMap<&str, &PathBuf> = scan
+        .iter()
+        .map(|(sid, p)| (sid.as_str(), p))
+        .collect();
     let mut sids = store.sids();
-    for (sid, _) in scan_session_files(mirror) {
-        sids.insert(sid);
+    for (sid, _) in &scan {
+        sids.insert(sid.clone());
     }
 
-    for sid in sids {
-        let rec = store.get(&sid);
+    // ── phase 1: serial snapshot collection ─────────────────────────
+    let mut snapshots: std::collections::BTreeMap<String, Snapshot> =
+        std::collections::BTreeMap::new();
+    let mut probe_targets: Vec<String> = Vec::new();
+    for sid in &sids {
+        let rec = store.get(sid);
         let file_rel = rec
             .as_ref()
             .and_then(|r| r.task.as_ref().map(|t| t.file.as_str()))
@@ -339,7 +655,38 @@ pub fn run<S: SessionReap>(
                 rec.as_ref()
                     .and_then(|r| r.pull.as_ref().map(|p| p.file.as_str()))
             });
-        let (probe, path) = probe_session_file(mirror, file_rel, &sid);
+        let path = file_rel
+            .map(|r| mirror.join(r))
+            .or_else(|| scan_map.get(sid.as_str()).map(|p| (*p).clone()));
+        let (mut probe, path) = stat_probe(path);
+        // §5.2's laziness: content only for its three consumers. The
+        // unreadable case never upgrades — it cannot be read, and the
+        // pass skips it downstream exactly as the old full-read probe's
+        // failure did.
+        if needs_content(rec.as_ref(), &probe) {
+            if let Some(p) = path.as_ref() {
+                read_content(&mut probe, p);
+            }
+        }
+        if !probe.unreadable && needs_b_probe(rec.as_ref(), probe.exists) {
+            probe_targets.push(sid.clone());
+        }
+        snapshots.insert(
+            sid.clone(),
+            Snapshot {
+                rec,
+                probe,
+                path,
+            },
+        );
+    }
+
+    // ── phase 2: bounded-parallel B probing ─────────────────────────
+    let bs = probe_parallel(&probe_targets, b_probe);
+
+    // ── phase 3: serial classify + execution (verbatim pre-D4 logic) ─
+    for (sid, snap) in snapshots {
+        let Snapshot { rec, probe, path } = snap;
         if probe.unreadable {
             // Same discipline as `BProbe::Unknown`: this round cannot
             // classify an unreadable file — every absence edge it would
@@ -349,7 +696,10 @@ pub fn run<S: SessionReap>(
                 .push(format!("{sid}: file unreadable — skipped this round"));
             continue;
         }
-        let b = b_probe(&sid);
+        // `bs` holds answers for pre-screened targets only — every other
+        // sid classifies on `Unknown`, which its verdict provably cannot
+        // read (needs_b_probe's conservative superset).
+        let b = bs.get(&sid).copied().unwrap_or(BProbe::Unknown);
         let verdict = state_machine::classify(rec.as_ref(), &probe, b);
         report.verdicts.push((sid.clone(), verdict));
         match verdict.action {
@@ -1545,5 +1895,407 @@ mod tests {
         );
         assert!(report.work.is_empty());
         std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // -- §5.1 scan once: the shared-scan resolution ------------------------
+
+    // Two unbound sids (no record binding their path) both resolve their
+    // files through the pass's single scan — before §5.1 each one paid a
+    // full tree walk of its own. The scan carries no counting seam (and
+    // adding one to production code for a test would invert the seam
+    // discipline), so the pin is behavioral: the scan's first-hit ordering
+    // IS the resolution — both sids classify on their own files and the
+    // committed task rows carry exactly the scan-resolved paths.
+    #[test]
+    fn unbound_sids_resolve_through_the_shared_scan() {
+        let (mirror, sync) = setup("scanonce");
+        write_session(&mirror, "ua", b"{\"a\":1}\n");
+        write_session(&mirror, "ub", b"{\"forkedFrom\":{\"sessionId\":\"x\"}}\n");
+        let mut st = State::empty_v3();
+        // The probe closure is incidental here — a probe count is not the
+        // scan's cost; the point of the test is resolution correctness.
+        let report = run(
+            &mirror,
+            &sync,
+            &mut st,
+            PassKind::Steady,
+            &|_: &str| BProbe::Absent,
+            &never_suspended,
+        )
+        .unwrap();
+        // Both scan-discovered sids classified — ua is a non-fork orphan
+        // (row 24), ub a fork candidate (row 22). Both needed the scan to
+        // locate their files; neither had a record binding.
+        let row_of = |sid: &str| {
+            report
+                .verdicts
+                .iter()
+                .find(|(s, _)| s == sid)
+                .map(|(_, v)| v.row)
+        };
+        assert_eq!(row_of("ua"), Some(24), "non-fork scan hit → orphan row");
+        assert_eq!(row_of("ub"), Some(22), "fork scan hit → row 22");
+        // And the task rows the verdicts committed carry the scan-resolved
+        // paths — proof the resolution landed on the right files.
+        assert_eq!(
+            st.sessions["ua"].task.as_ref().unwrap().file,
+            "projects/lab/ua.jsonl"
+        );
+        assert_eq!(
+            st.sessions["ub"].task.as_ref().unwrap().file,
+            "projects/lab/ub.jsonl"
+        );
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // -- §5.2 lazy content: the needs-content predicate, table-driven ------
+
+    #[test]
+    fn needs_content_table_driven() {
+        // Helpers: a probe for an existing file vs an absent one.
+        let exists = || {
+            let mut p = FileProbe::absent();
+            p.exists = true;
+            p.len = 10;
+            p
+        };
+        let absent = FileProbe::absent();
+        let pull_only = || pull_rec("s", "zpc1.7.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        // No file: nothing is ever read.
+        assert!(!needs_content(None, &absent));
+        // The steady 99% shape — pull ∧ full ∧ file: NO content read.
+        assert!(!needs_content(Some(&pull_only()), &exists()));
+        // …even when the pull record's file is a fork-shaped file: fork
+        // evidence has no consumer on pull records (rows 22/24 demand
+        // fieldless records).
+        // Tombstone with a non-null fileId: fingerprint compared → read.
+        let mut tomb = pull_only();
+        tomb.bury("t", Some("sha256:00000000000000000000000000000000".into()));
+        assert!(needs_content(Some(&tomb), &exists()));
+        // Tombstone with fileId null: sealed unconditionally → NO read.
+        let mut sealed = pull_only();
+        sealed.bury("t", None);
+        assert!(!needs_content(Some(&sealed), &exists()));
+        // No record: rows 22/24's fork judgment applies → read.
+        assert!(needs_content(None, &exists()));
+        // All-empty record: same judgment → read.
+        assert!(needs_content(Some(&SessionRecord::default()), &exists()));
+        // Zombie (`pullPending` only): row 22's conjuncts do NOT exclude
+        // it — a zombie over a dropped fork file hits row 22 on fork
+        // evidence, so the bytes ARE read even though the row-27 reap
+        // itself never consults content. Zero-semantic-change wins over
+        // read minimality.
+        assert!(needs_content(Some(&zombie_rec()), &exists()));
+        // materialized=stub: rows 12/15's shell recognition → read.
+        let mut stub = pull_only();
+        stub.materialized = Some(state::Materialized::Stub);
+        assert!(needs_content(Some(&stub), &exists()));
+        // materialized=unloaded: no shell consumer → NO read.
+        let mut unloaded = pull_only();
+        unloaded.materialized = Some(state::Materialized::Unloaded);
+        assert!(!needs_content(Some(&unloaded), &exists()));
+        // A task-carrying record: rows 1–5 read no content → NO read.
+        let mut tasked = SessionRecord::default();
+        tasked.task = Some(Task {
+            file: "projects/lab/s.jsonl".into(),
+            phase: state::Phase::Validated,
+            first_seen: "t".into(),
+            enqueued_at: "t".into(),
+            last_error: None,
+        });
+        assert!(!needs_content(Some(&tasked), &exists()));
+    }
+
+    // End-to-end laziness: a steady pull session whose file is
+    // permission-unreadable still classifies row 16 Steady — the pass
+    // never opened it for content, so the read failure it would have hit
+    // cannot skip it. Under a root-run test environment the chmod is a
+    // no-op and the verdict is the same row either way, so the assertion
+    // is unconditional; what it pins is "steady pull needs no content".
+    #[test]
+    fn steady_pull_session_never_reads_file_content() {
+        let (mirror, sync) = setup("lazy");
+        let file = write_session(&mirror, "s1", b"1234567");
+        let mut st = State::empty_v3();
+        st.sessions.insert(
+            "s1".into(),
+            pull_rec("s1", "zpc1.7.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        );
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let report = run(
+            &mirror,
+            &sync,
+            &mut st,
+            PassKind::Steady,
+            &|_: &str| BProbe::Unknown,
+            &never_suspended,
+        )
+        .unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let readable = std::fs::File::open(&file).is_ok();
+        if !readable {
+            // Content truly unreadable: the stat probe caught the open
+            // failure — so either the sid is skipped (unreadable) or it
+            // classified row 16 on stat evidence. The ONE thing that must
+            // never happen is a verdict depending on content it could
+            // not have read — and row 16/§7.2 is exactly the len-only
+            // consumer: cursor covers all 7 bytes, a clean match.
+            let row = report
+                .verdicts
+                .iter()
+                .find(|(s, _)| s == "s1")
+                .map(|(_, v)| v.row);
+            assert!(
+                row == Some(16) || row.is_none(),
+                "steady pull must classify without content: {row:?} / {:?}",
+                report.notes
+            );
+        } else {
+            // Root or ACL-less fs: assert the verdict content-neutrally.
+            assert!(report
+                .verdicts
+                .iter()
+                .any(|(s, v)| s == "s1" && v.row == 16));
+        }
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // The inverse pin: content-consuming shapes still READ — a tombstone
+    // `fileId` match must still suppress-and-delete (the byte comparison
+    // actually happened), and a scan-discovered fork file still hits row
+    // 22 (forkedFrom evidence actually read).
+    #[test]
+    fn content_consumers_still_read_bytes() {
+        let (mirror, sync) = setup("eager");
+        let bytes = b"{\"x\":1}\n";
+        let file = write_session(&mirror, "s7", bytes);
+        let mut st = State::empty_v3();
+        let mut rec = pull_rec("s7", "zpc1.7.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        rec.bury("t", Some(state::file_id_of(bytes)));
+        st.sessions.insert("s7".into(), rec);
+        let report = run(
+            &mirror,
+            &sync,
+            &mut st,
+            PassKind::Steady,
+            &|_: &str| BProbe::Absent,
+            &never_suspended,
+        )
+        .unwrap();
+        assert!(
+            report
+                .verdicts
+                .iter()
+                .any(|(s, v)| s == "s7" && v.row == 0),
+            "fingerprint comparison ran — row 0 suppress"
+        );
+        assert!(!file.exists(), "the instance-hit file is re-deleted");
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // -- §5.3 pre-screen: probe only what can read the answer --------------
+
+    #[test]
+    fn needs_b_probe_table_driven() {
+        let pull_only = || pull_rec("s", "zpc1.7.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        // No record → row 23 can hit: probe.
+        assert!(needs_b_probe(None, false));
+        assert!(needs_b_probe(None, true));
+        // pull → rows 7/8/12–16 vs 18 discriminate on Absent: probe.
+        assert!(needs_b_probe(Some(&pull_only()), true));
+        assert!(needs_b_probe(Some(&pull_only()), false));
+        // pullPending-only zombie → row 27 is needs_b: probe.
+        assert!(needs_b_probe(Some(&zombie_rec()), false));
+        // registered → rows 19–21 are needs_b: probe.
+        let mut reg = SessionRecord::default();
+        reg.registered = Some(state::Registered {
+            kind: "b-owned".into(),
+            at: "t".into(),
+        });
+        assert!(needs_b_probe(Some(&reg), true));
+        assert!(needs_b_probe(Some(&reg), false));
+        // publishedAt (spec's conservative conjunct): probe.
+        let mut pubed = SessionRecord::default();
+        pubed.published_at = Some("t".into());
+        assert!(needs_b_probe(Some(&pubed), true));
+        // task-carrying: rows 1–5 never read b — but the conjuncts don't
+        // special-case a task+pull mix; the honest no-probe shape is a
+        // bare task record.
+        let mut tasked = SessionRecord::default();
+        tasked.task = Some(Task {
+            file: "f".into(),
+            phase: state::Phase::Validated,
+            first_seen: "t".into(),
+            enqueued_at: "t".into(),
+            last_error: None,
+        });
+        assert!(
+            !needs_b_probe(Some(&tasked), true),
+            "bare task rows 1–5 are probe-independent"
+        );
+        assert!(!needs_b_probe(Some(&tasked), false));
+        // All-empty record WITH a file → row 24 is needs_b: probe.
+        assert!(needs_b_probe(Some(&SessionRecord::default()), true));
+        // …without a file → row 26 is probe-independent: NO probe.
+        assert!(!needs_b_probe(Some(&SessionRecord::default()), false));
+        // Tombstoned-only record: row 0 + fieldless remainder — no
+        // probe-dependent row reachable even with a file (deleted is a
+        // field, so rows 22/24/26 cannot hit): NO probe.
+        let mut tomb = SessionRecord::default();
+        tomb.bury("t", None);
+        assert!(!needs_b_probe(Some(&tomb), true));
+        assert!(!needs_b_probe(Some(&tomb), false));
+    }
+
+    // The probe-count pin of the pre-screen: a mixed pass probes exactly
+    // the needing sids. The zombie MUST be probed (row 27 regression —
+    // a zombie skipped by the pre-screen would live forever), the bare
+    // task record must not.
+    #[test]
+    fn prescreen_probes_only_needing_sids() {
+        let (mirror, sync) = setup("prescreen");
+        let probed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let probed2 = std::sync::Arc::clone(&probed);
+        let counter = move |sid: &str| {
+            probed2.lock().unwrap().push(sid.to_string());
+            BProbe::Absent
+        };
+        let mut st = State::empty_v3();
+        st.sessions.insert("z".into(), zombie_rec());
+        st.sessions.insert(
+            "t1".into(),
+            SessionRecord {
+                task: Some(Task {
+                    file: "projects/lab/t1.jsonl".into(),
+                    phase: state::Phase::Writing,
+                    first_seen: "t".into(),
+                    enqueued_at: "t".into(),
+                    last_error: None,
+                }),
+                ..Default::default()
+            },
+        );
+        write_session(&mirror, "t1", b"{\"a\":1}\n");
+        st.sessions.insert(
+            "p1".into(),
+            pull_rec("p1", "zpc1.7.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        );
+        let report = run(&mirror, &sync, &mut st, PassKind::Steady, &counter, &never_suspended)
+            .unwrap();
+        let got = probed.lock().unwrap().clone();
+        assert!(got.contains(&"z".to_string()), "zombie probed: {got:?}");
+        assert!(got.contains(&"p1".to_string()), "pull probed: {got:?}");
+        assert!(
+            !got.contains(&"t1".to_string()),
+            "bare task rows 1–5 never read the probe: {got:?}"
+        );
+        // …and the zombie actually reaped — the probe answer reached its
+        // verdict through the parallel fan-out.
+        assert!(report.reaped.contains(&"z".to_string()));
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // -- §5.3 parallel fan-out: correctness and concurrency ----------------
+
+    // Answer binding across lanes: every probe answer must land on its
+    // OWN sid — a crosswired answer reaps a registered session or spares
+    // a zombie, so the test forces per-sid DISTINCT answers through the
+    // parallel path and checks the verdicts row by row. 20 targets spans
+    // two lanes minimum.
+    #[test]
+    fn parallel_probe_answers_bind_to_their_own_sids() {
+        let (mirror, sync) = setup("fanout");
+        let mut st = State::empty_v3();
+        // 10 zombies (reap iff Absent) + 10 registered-no-file records
+        // (FirstPull iff Present, Hold iff Absent).
+        for n in 0..10 {
+            st.sessions.insert(format!("z{n}"), zombie_rec());
+            st.sessions.insert(
+                format!("r{n}"),
+                SessionRecord {
+                    registered: Some(state::Registered {
+                        kind: "b-owned".into(),
+                        at: "t".into(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        let probe = |sid: &str| {
+            // Zombies answer Absent, registered answer Present — the
+            // distinctness is in the sid prefix, and the verdicts below
+            // differ row-for-row.
+            if sid.starts_with('z') {
+                BProbe::Absent
+            } else {
+                BProbe::Present
+            }
+        };
+        let mut store = CountingStore::new(st);
+        let report = run(
+            &mirror,
+            &sync,
+            &mut store,
+            PassKind::Steady,
+            &probe,
+            &never_suspended,
+        )
+        .unwrap();
+        // Every zombie reaped — its OWN Absent answer, not a neighbor's.
+        for n in 0..10 {
+            assert!(
+                report.reaped.contains(&format!("z{n}")),
+                "z{n} reaped on its own Absent"
+            );
+        }
+        // Every registered sid hit row 21 — its OWN Present answer.
+        for n in 0..10 {
+            let sid = format!("r{n}");
+            assert!(
+                report
+                    .verdicts
+                    .iter()
+                    .any(|(s, v)| s == &sid && v.row == 21),
+                "{sid} first-pull row 21 on its own Present: {:?}",
+                report.verdicts.iter().filter(|(s, _)| s.starts_with('r')).collect::<Vec<_>>()
+            );
+        }
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // The concurrency is real, not decorative: overlapping probes must be
+    // observed in flight. A barrier-style probe that sleeps briefly makes
+    // serialization provably visible (max concurrency would be 1); lane
+    // overlap drives it above 1. This is a lane count, not a wall-clock
+    // assertion — no timing flakiness beyond the 5ms sleep granularity.
+    #[test]
+    fn parallel_probe_actually_overlaps() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+        let inflight = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_inflight = std::sync::Arc::new(AtomicUsize::new(0));
+        let inflight2 = std::sync::Arc::clone(&inflight);
+        let max2 = std::sync::Arc::clone(&max_inflight);
+        let probe = move |_sid: &str| {
+            let now = inflight2.fetch_add(1, AOrd::SeqCst) + 1;
+            max2.fetch_max(now, AOrd::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            inflight2.fetch_sub(1, AOrd::SeqCst);
+            BProbe::Present
+        };
+        let targets: Vec<String> = (0..8).map(|n| format!("t{n}")).collect();
+        let out = probe_parallel(&targets, &probe);
+        assert_eq!(out.len(), 8, "every target answered");
+        assert!(out.values().all(|b| *b == BProbe::Present));
+        assert!(
+            max_inflight.load(AOrd::SeqCst) > 1,
+            "probes overlapped in flight — max concurrency {}",
+            max_inflight.load(AOrd::SeqCst)
+        );
+        // Degenerate inputs never spawn and never lose answers.
+        let empty: [String; 0] = [];
+        assert!(probe_parallel(&empty, &probe).is_empty());
+        let one = probe_parallel(&["solo".to_string()], &probe);
+        assert_eq!(one.get("solo"), Some(&BProbe::Present));
     }
 }

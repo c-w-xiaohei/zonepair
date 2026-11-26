@@ -113,19 +113,33 @@ pub enum ExitReason {
 /// The production `b_probe` (§3.7 seam): `store_exists` over the wire.
 /// `ExecCtx.b_probe` is a sync `Fn`, so the async call goes through
 /// `block_in_place` — reconcile passes run inside pool tasks on the
-/// multi-thread runtime, where that is legal. Any probe failure or an
+/// multi-thread runtime, where that is legal.
+///
+/// The runtime `Handle` is captured AT CONSTRUCTION, not discovered per
+/// call: reconcile §5.3 fans probes out onto `std::thread::scope` lanes,
+/// which are plain OS threads — the worker's thread-local runtime
+/// context does not propagate, so `Handle::current()` would panic there.
+/// A captured `Handle` is self-contained: `handle.block_on` enters the
+/// runtime from any thread, and `block_in_place` outside the runtime
+/// context is itself a plain call (tokio's documented no-op path), so
+/// lane threads, pool workers, and the sync boot path all execute the
+/// same closure correctly. Any probe failure or an
 /// absent endpoint answers `Unknown` — never guessed.
 fn http_b_probe(base: Option<&Base>, token: Option<String>) -> Arc<dyn Fn(&str) -> BProbe + Send + Sync> {
     let base = base.cloned();
+    // `try_current`, never `current`: construction without a runtime
+    // (unit tests wiring parts by hand) must not panic — a probe with no
+    // runtime is simply always Unknown, the same answer the no-endpoint
+    // arm gives, and never a guess either way.
+    let handle = tokio::runtime::Handle::try_current().ok();
     Arc::new(move |sid: &str| {
-        let Some(base) = base.clone() else {
+        let (Some(base), Some(handle)) = (base.clone(), handle.clone()) else {
             return BProbe::Unknown;
         };
         let token = token.clone();
         let sid = sid.to_string();
         match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(api::store_exists(&base, token.as_deref(), &sid))
+            handle.block_on(api::store_exists(&base, token.as_deref(), &sid))
         }) {
             Ok(true) => BProbe::Present,
             Ok(false) => BProbe::Absent,
@@ -151,7 +165,11 @@ pub async fn run(
     parts: ExecParts,
     cfg: &DaemonConfig,
 ) -> Result<std::result::Result<ExitReason, BootBlocked>> {
-    let booted = match startup::boot(mirror, parts)? {
+    // Boot's soft watchdog budget (spec §5.4): five heartbeat rounds of
+    // silence earns ONE warning line — never a kill. Boot is bounded work
+    // made expensive by the old cost model, not a hang; killing it would
+    // amplify the death spiral (every rebirth repays the full boot).
+    let booted = match startup::boot(mirror, parts, cfg.heartbeat_max_round * 5)? {
         Ok(b) => b,
         Err(blocked) => return Ok(Err(blocked)),
     };
@@ -164,6 +182,10 @@ pub async fn run(
 /// §9.1-9 — the loop. Runs until the stop marker, the inode self-check,
 /// or the self-heartbeat exits it.
 pub async fn run_loop(booted: &Booted, cfg: &DaemonConfig) -> Result<ExitReason> {
+    // §9.1 step 9 is the loop itself: enter once, never "done" — a boot
+    // trace reader diffing enter/done lines sees exactly where the daemon
+    // is by what is missing.
+    eprintln!("zonepaird: boot step 9/9 enter — main loop");
     let Booted {
         owner,
         sync_dir,
@@ -453,7 +475,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn t641_stop_marker_exits_gracefully() {
         let mirror = tmp("t641-stop");
-        let booted = startup::boot(&mirror, unknown_parts())
+        let booted = startup::boot(&mirror, unknown_parts(), Duration::ZERO)
             .unwrap()
             .unwrap();
         let sync = booted.sync_dir.clone();
@@ -490,7 +512,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn t640_sync_rebuild_exits_lock_lost() {
         let mirror = tmp("t640-loop");
-        let booted = startup::boot(&mirror, unknown_parts())
+        let booted = startup::boot(&mirror, unknown_parts(), Duration::ZERO)
             .unwrap()
             .unwrap();
         let sync = booted.sync_dir.clone();
@@ -514,7 +536,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn t641_round_budget_exits_on_heartbeat() {
         let mirror = tmp("t641-beat");
-        let booted = startup::boot(&mirror, unknown_parts())
+        let booted = startup::boot(&mirror, unknown_parts(), Duration::ZERO)
             .unwrap()
             .unwrap();
         let mut cfg = fast_cfg();
@@ -528,7 +550,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn heartbeat_updates_lock_mtime() {
         let mirror = tmp("beat-mtime");
-        let booted = startup::boot(&mirror, unknown_parts())
+        let booted = startup::boot(&mirror, unknown_parts(), Duration::ZERO)
             .unwrap()
             .unwrap();
         let lock = booted.sync_dir.join(owner::LOCK_FILE);
@@ -545,7 +567,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn loop_drains_intents_written_after_boot() {
         let mirror = tmp("drain-live");
-        let booted = startup::boot(&mirror, unknown_parts())
+        let booted = startup::boot(&mirror, unknown_parts(), Duration::ZERO)
             .unwrap()
             .unwrap();
         let shared = booted.shared.clone();
@@ -599,7 +621,7 @@ mod tests {
     async fn run_reports_already_owned() {
         let mirror = tmp("run-owned");
         let cfg = fast_cfg();
-        let held = startup::boot(&mirror, unknown_parts())
+        let held = startup::boot(&mirror, unknown_parts(), Duration::ZERO)
             .unwrap()
             .unwrap();
         let second = run(&mirror, unknown_parts(), &cfg).await.unwrap();
@@ -627,7 +649,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn e4_active_tick_queues_pull_for_active_pull_sids() {
         let mirror = tmp("e4");
-        let booted = startup::boot(&mirror, unknown_parts())
+        let booted = startup::boot(&mirror, unknown_parts(), Duration::ZERO)
             .unwrap()
             .unwrap();
         let shared = booted.shared.clone();
@@ -706,7 +728,7 @@ mod tests {
             b_probe: Some(Arc::new(|_| BProbe::Unknown)),
             ..Default::default()
         };
-        let booted = startup::boot(&mirror, parts).unwrap().unwrap();
+        let booted = startup::boot(&mirror, parts, Duration::ZERO).unwrap().unwrap();
         let shared = booted.shared.clone();
         let sync = booted.sync_dir.clone();
         shared

@@ -40,6 +40,7 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::sync::state_machine::BProbe;
 use crate::sync::persist::journal::{self};
@@ -130,10 +131,86 @@ impl ExecParts {
     }
 }
 
+/// Boot observability (spec §5.4): every step prints an `enter` and a
+/// `done` line to stderr — the death spiral was undiagnosable precisely
+/// because boot was silent, and pairing enter/done tells a log reader
+/// which step is CURRENTLY running (an enter without its done) versus
+/// merely slow. Steps 3/4 land in the same `Shared::open` call but keep
+/// separate lines: the trace is step-numbered, not call-shaped. Step 5
+/// prints a marker pair even though the step is removed — a missing 5
+/// in the trace would read as boot-hung-inside-5 to anyone walking §9.1.
+/// Step 9's enter line is emitted by the main loop (`daemon::run_loop`).
+macro_rules! boot_step {
+    ($n:literal, $name:literal, $body:expr) => {{
+        eprintln!("zonepaird: boot step {}/8 enter — {}", $n, $name);
+        let t = Instant::now();
+        let out = $body;
+        eprintln!("zonepaird: boot step {}/8 done ({:?}) — {}", $n, t.elapsed(), $name);
+        out
+    }};
+}
+
+/// Disarm for boot's soft watchdog: the armed thread fires at most once
+/// when the budget elapses, then idles until boot ends. `Drop` covers
+/// the error paths too — a failed boot must not leave the thread alive
+/// to print "still working" about a boot that already died loudly.
+struct BootWatchdogDisarm(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for BootWatchdogDisarm {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Arm boot's soft watchdog (spec §5.4 — explicitly NOT a hard kill):
+/// if boot is still running `boot_budget` after it started, print ONE
+/// warning line and keep working. Boot is bounded work made expensive by
+/// the cost model, not a hang — killing it would amplify the death
+/// spiral (every rebirth repays the full boot), while the warning turns
+/// "the daemon never comes up" into diagnosable evidence. `Duration::ZERO`
+/// disarms the watchdog entirely (tests).
+fn arm_boot_watchdog(boot_budget: Duration) -> BootWatchdogDisarm {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let disarmed = Arc::new(AtomicBool::new(false));
+    if boot_budget > Duration::ZERO {
+        let flag = Arc::clone(&disarmed);
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + boot_budget;
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+                if flag.load(Ordering::Relaxed) {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    eprintln!(
+                        "zonepaird: boot still working after {boot_budget:?} — slow, not hung; \
+                         no watchdog kill (death-spiral amplifier); see spec §5.4"
+                    );
+                    return;
+                }
+            }
+        });
+    }
+    BootWatchdogDisarm(disarmed)
+}
+
 /// Steps 1–8 of §9.1. `Ok(Err(BootBlocked))` on a held lock; a real error
 /// is `Err` — startup failures are loud, the daemon does not limp.
-pub fn boot(mirror: &Path, parts: ExecParts) -> Result<std::result::Result<Booted, BootBlocked>> {
+/// `boot_budget` is the soft watchdog's fuse (production: `5 ×
+/// heartbeat_max_round`); zero disarms it.
+pub fn boot(
+    mirror: &Path,
+    parts: ExecParts,
+    boot_budget: Duration,
+) -> Result<std::result::Result<Booted, BootBlocked>> {
+    // The watchdog arms first and disarms last: its whole point is the
+    // window where boot is alive but silent, and error exits disarm it
+    // through the guard's Drop.
+    let _watchdog = arm_boot_watchdog(boot_budget);
+
     // ── 1. take the lock ────────────────────────────────────────────
+    eprintln!("zonepaird: boot step 1/8 enter — take owner lock");
+    let step1 = Instant::now();
     let sync_dir = state::ensure_sync_dir(mirror)?;
     let Some(owner) = owner::acquire(&sync_dir)? else {
         return Ok(Err(BootBlocked::AlreadyOwned));
@@ -153,16 +230,21 @@ pub fn boot(mirror: &Path, parts: ExecParts) -> Result<std::result::Result<Boote
     // The SIGTERM target rides next to the lock — best-effort; a stale
     // pid file is harmless (stop probes the lock anyway).
     let _ = owner.write_pid(&sync_dir);
+    eprintln!("zonepaird: boot step 1/8 done ({:?}) — lock held", step1.elapsed());
 
     // ── 2. clear half-finished work ─────────────────────────────────
-    let cleanup = cleanup(mirror, &sync_dir)?;
+    let cleanup = boot_step!(2, "clear half-finished work", cleanup(mirror, &sync_dir)?);
 
     // ── 3. read authority ── 4. inherit failure state ────────────────
     // `Shared::open` runs `state::load`: missing → empty v3, v2 →
     // upgrade, corrupt → quarantine + empty table, and any
     // `state.corrupt-*` residue latches `fail_closed` — steps 3 and 4
     // land together by construction.
+    eprintln!("zonepaird: boot step 3/8 enter — read state");
+    let step34 = Instant::now();
     let (shared, corruption) = Shared::open(mirror)?;
+    eprintln!("zonepaird: boot step 3/8 done ({:?}) — state loaded", step34.elapsed());
+    eprintln!("zonepaird: boot step 4/8 enter — inherit failure state");
     if let Some(c) = &corruption {
         eprintln!(
             "zonepaird: FAIL-CLOSED — {c}; all tasks suspend, journal replay \
@@ -170,6 +252,7 @@ pub fn boot(mirror: &Path, parts: ExecParts) -> Result<std::result::Result<Boote
              recover by fixing or deleting the state.corrupt-* file"
         );
     }
+    eprintln!("zonepaird: boot step 4/8 done ({:?}) — failure state inherited", step34.elapsed());
 
     let ctx = parts.into_ctx(shared.clone());
     let pool = Pool::new(ctx.clone());
@@ -178,10 +261,12 @@ pub fn boot(mirror: &Path, parts: ExecParts) -> Result<std::result::Result<Boote
     // with `wait_cursor`: receivers it primed would never exist, and the
     // sender GC (`Notify::signal` drops receiver-less channels) made the
     // ritual a no-op. Step numbering preserved for §9.1 parity.
+    eprintln!("zonepaird: boot step 5/8 enter — rebuild notify table (removed: wait_cursor retired)");
+    eprintln!("zonepaird: boot step 5/8 done (0ns) — no-op by removal");
 
     // ── 6. replay the journal ───────────────────────────────────────
     // Fail-closed does not gate replay: intents land, execution suspends.
-    let report = pool.drain_journal()?;
+    let report = boot_step!(6, "replay journal", pool.drain_journal()?);
     let replayed = report.consumed.len();
     for (name, err) in &report.errors {
         eprintln!("zonepaird: journal record {name} unparseable after cleanup: {err}");
@@ -198,6 +283,8 @@ pub fn boot(mirror: &Path, parts: ExecParts) -> Result<std::result::Result<Boote
     // enqueues: key dedup collapses whatever step 6's replay already
     // fed, and pick()'s eligibility gates do the rest. `writing` holds:
     // the row itself is the queued state, only ensure-task advances it.
+    eprintln!("zonepaird: boot step 7/8 enter — recover in-flight work");
+    let step7 = Instant::now();
     let mut recovered = 0;
     {
         let susp = shared.suspend.lock().unwrap();
@@ -231,12 +318,17 @@ pub fn boot(mirror: &Path, parts: ExecParts) -> Result<std::result::Result<Boote
             }
         });
     }
+    eprintln!("zonepaird: boot step 7/8 done ({:?}) — in-flight work recovered", step7.elapsed());
 
     // ── 8. startup reconcile ────────────────────────────────────────
     // Startup partition: `len > cursor bytes` truncates our own torn
     // tail; the steady partition (any mismatch → degraded) is wrong
     // here — the crash window guarantees benign residue exists.
-    let reconcile = run_reconcile_pass(&ctx, &pool, PassKind::Startup)?;
+    let reconcile = boot_step!(
+        8,
+        "startup reconcile pass",
+        run_reconcile_pass(&ctx, &pool, PassKind::Startup)?
+    );
 
     // ── 9. → main loop (caller) ─────────────────────────────────────
     let report = StartupReport {
@@ -408,10 +500,10 @@ mod tests {
     #[test]
     fn t630_held_lock_blocks_second_boot() {
         let mirror = tmp("t630-boot");
-        let first = boot(&mirror, unknown_b_probe()).unwrap().unwrap();
+        let first = boot(&mirror, unknown_b_probe(), Duration::ZERO).unwrap().unwrap();
         // `.sync/` + owner.lock materialized at step 1.
         assert!(first.sync_dir.join("owner.lock").exists());
-        let second = boot(&mirror, unknown_b_probe()).unwrap();
+        let second = boot(&mirror, unknown_b_probe(), Duration::ZERO).unwrap();
         assert!(
             matches!(second, Err(BootBlocked::AlreadyOwned)),
             "held lock must block the second boot — self-convergence"
@@ -439,7 +531,7 @@ mod tests {
             log.metadata().unwrap().ino()
         };
 
-        let first = boot(&mirror, unknown_b_probe()).unwrap().unwrap();
+        let first = boot(&mirror, unknown_b_probe(), Duration::ZERO).unwrap().unwrap();
         assert_eq!(
             std::fs::read(&rotated).unwrap().len() as u64,
             owner::STDERR_LOG_MAX_BYTES + 1,
@@ -465,7 +557,7 @@ mod tests {
         // leaves it byte-identical — a loser's rotation would be the
         // original Finding-1 shape wearing a new coat.
         std::fs::write(&log, vec![b'y'; (owner::STDERR_LOG_MAX_BYTES + 1) as usize]).unwrap();
-        let second = boot(&mirror, unknown_b_probe()).unwrap();
+        let second = boot(&mirror, unknown_b_probe(), Duration::ZERO).unwrap();
         assert!(matches!(second, Err(BootBlocked::AlreadyOwned)));
         assert_eq!(
             log.metadata().unwrap().len(),
@@ -514,7 +606,7 @@ mod tests {
         )
         .unwrap();
 
-        let booted = boot(&mirror, unknown_b_probe()).unwrap().unwrap();
+        let booted = boot(&mirror, unknown_b_probe(), Duration::ZERO).unwrap().unwrap();
         let c = &booted.report.cleanup;
         assert_eq!(c.zp_removed, 2);
         assert_eq!(c.sync_tmp_removed, 1);
@@ -538,7 +630,7 @@ mod tests {
     fn t632_load_paths_missing_v2_corrupt() {
         // Missing → empty table.
         let mirror = tmp("t632a");
-        let booted = boot(&mirror, unknown_b_probe()).unwrap().unwrap();
+        let booted = boot(&mirror, unknown_b_probe(), Duration::ZERO).unwrap().unwrap();
         assert!(booted.report.corruption.is_none());
         assert!(booted.shared.with_state(|st| st.sessions.is_empty()));
         drop(booted);
@@ -556,7 +648,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let booted = boot(&mirror, unknown_b_probe()).unwrap().unwrap();
+        let booted = boot(&mirror, unknown_b_probe(), Duration::ZERO).unwrap().unwrap();
         assert!(booted.report.corruption.is_none());
         let rec = booted.shared.with_state(|st| st.sessions["s1"].clone());
         assert_eq!(rec.materialization(), state::Materialized::Full);
@@ -566,7 +658,7 @@ mod tests {
         let mirror = tmp("t632c");
         let sync = state::ensure_sync_dir(&mirror).unwrap();
         std::fs::write(sync.join("state.json"), b"{not json").unwrap();
-        let booted = boot(&mirror, unknown_b_probe()).unwrap().unwrap();
+        let booted = boot(&mirror, unknown_b_probe(), Duration::ZERO).unwrap().unwrap();
         let c = booted.report.corruption.expect("corruption latches");
         assert!(c.quarantined.exists());
         assert!(!sync.join("state.json").exists());
@@ -601,7 +693,7 @@ mod tests {
             },
         )
         .unwrap();
-        let booted = boot(&mirror, unknown_b_probe()).unwrap().unwrap();
+        let booted = boot(&mirror, unknown_b_probe(), Duration::ZERO).unwrap().unwrap();
         // Replay landed: task row committed as validated.
         let task = booted
             .shared
@@ -671,7 +763,7 @@ mod tests {
         );
         state::commit(&sync, &st).unwrap();
 
-        let booted = boot(&mirror, unknown_b_probe()).unwrap().unwrap();
+        let booted = boot(&mirror, unknown_b_probe(), Duration::ZERO).unwrap().unwrap();
         assert_eq!(
             booted.report.recovered, 3,
             "arm (a) validated + arm (b) pull + arm (c') pullPending"
@@ -707,7 +799,7 @@ mod tests {
         );
         state::commit(&sync, &st).unwrap();
 
-        let booted = boot(&mirror, unknown_b_probe()).unwrap().unwrap();
+        let booted = boot(&mirror, unknown_b_probe(), Duration::ZERO).unwrap().unwrap();
         assert_eq!(
             booted.report.recovered, 1,
             "exactly arm (c') fires — the pending's boot channel"
@@ -759,7 +851,7 @@ mod tests {
         );
         state::commit(&sync, &st).unwrap();
 
-        let booted = boot(&mirror, unknown_b_probe()).unwrap().unwrap();
+        let booted = boot(&mirror, unknown_b_probe(), Duration::ZERO).unwrap().unwrap();
         assert_eq!(booted.report.recovered, 1, "exactly the pull arm fires");
         let work = booted.pool.pick().expect("arm (b) enqueued the pull");
         assert_eq!(
@@ -813,7 +905,7 @@ mod tests {
         )
         .unwrap();
 
-        let booted = boot(&mirror, unknown_b_probe()).unwrap().unwrap();
+        let booted = boot(&mirror, unknown_b_probe(), Duration::ZERO).unwrap().unwrap();
         assert!(
             booted.shared.with_state(|st| st.sessions["s1"].deleted.is_some()),
             "the replayed tombstone lands before step 7"
@@ -847,7 +939,7 @@ mod tests {
         st.sessions.insert("s7".into(), rec);
         state::commit(&sync, &st).unwrap();
 
-        let booted = boot(&mirror, unknown_b_probe()).unwrap().unwrap();
+        let booted = boot(&mirror, unknown_b_probe(), Duration::ZERO).unwrap().unwrap();
         assert!(
             !mirror.join("projects/lab/s7.jsonl").exists(),
             "tombstoned file re-deleted at startup"
@@ -882,7 +974,7 @@ mod tests {
         );
         state::commit(&sync, &st).unwrap();
 
-        let booted = boot(&mirror, unknown_b_probe()).unwrap().unwrap();
+        let booted = boot(&mirror, unknown_b_probe(), Duration::ZERO).unwrap().unwrap();
         assert_eq!(
             std::fs::metadata(mirror.join("projects/lab/s1.jsonl"))
                 .unwrap()
