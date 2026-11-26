@@ -23,6 +23,9 @@
 //! |   | convergence flows through the Steady arm's §7.2 length predicate |
 //! | HydrateReset / FirstPull | `Work::Pull{force_reset}` — worker zero-cursor |
 //! | BackfillRegistered | `registered{kind:"b-owned"}` + commit |
+//! | Reap | collect the zombie sid; ONE batch delete commit at pass end |
+//! |   | (row 27 — no execution surface, so RFC-0003 §9.2's one-record- |
+//! |   | wide crash window does not forbid the batch) |
 //!
 //! The scan set is `projects/**/<sid>.jsonl`, `*.zp*` temp residue
 //! excluded. State IO goes through the `SessionStore` seam so a pass can
@@ -39,6 +42,7 @@
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::sync::state_machine::{
     self, Action, BProbe, FileProbe, LengthSource, LengthVerdict, Verdict,
@@ -48,7 +52,7 @@ use crate::sync::persist::state::{self, SessionRecord, Task};
 #[cfg(test)]
 use crate::sync::persist::state::State;
 use crate::sync::persist::time::now_rfc3339;
-use super::shared::SessionStore;
+use super::shared::{SessionStore, Shared};
 
 /// Where this pass runs in the daemon's lifecycle: the §7.2 length
 /// predicate splits by caller — startup trusts a torn tail (truncate),
@@ -92,6 +96,93 @@ impl SessionStore for State {
     }
 }
 
+/// The row-27 batch deletion seam — `SessionStore` plus the one operation
+/// the reap verdict needs that per-record mutation cannot express:
+/// removing entries wholesale. The whole pass's reap set is deleted in
+/// ONE commit, the batching licence row 27 earns by having no execution
+/// surface (RFC-0003 §9.2's one-record-wide crash window guards
+/// *destructive execution* — file deletion, truncation; erasing a zombie
+/// record is the entire action, so a crash mid-batch is merely "fewer
+/// zombies reaped this round", and the survivors classify identically
+/// next pass).
+///
+/// Lives in this module rather than `shared.rs` because it is reconcile's
+/// private execution detail: nothing else may delete session records.
+pub trait SessionReap: SessionStore {
+    /// Delete the given sids' records in one commit; returns the sids
+    /// actually removed. Implementations MUST re-validate the zombie
+    /// shape (`pull_pending` present, every other field absent) inside
+    /// the same lock hold as the removal — a record that picked up real
+    /// fields between the verdict and the commit (a concurrent journal
+    /// drain landing register/pull traffic) is not a zombie anymore, and
+    /// deleting it would silently drop the resurrected intent.
+    fn reap_commit(&mut self, sync_dir: &Path, sids: &[String]) -> Result<Vec<String>>;
+}
+
+/// The zombie-shape re-validation `reap_commit` implementations share —
+/// deliberately the exact conjunct set of `state_machine`'s row 27 minus
+/// the probe inputs (file/B evidence cannot be re-taken inside the
+/// commit lock; the fields are the part that can race).
+fn reapable(rec: &SessionRecord) -> bool {
+    rec.pull_pending.is_some()
+        && rec.pull.is_none()
+        && rec.task.is_none()
+        && rec.published_at.is_none()
+        && rec.deleted.is_none()
+        && rec.registered.is_none()
+        && rec.materialized.is_none()
+        && rec.last_unchanged_at.is_none()
+}
+
+/// Production seam: the batch delete goes through `Shared::commit_state` —
+/// the HEAD commit funnel (one lock hold mutate + `state::commit`), the
+/// same transaction discipline every other writer uses. The deletion is
+/// atomic against all readers because it happens inside the funnel's
+/// single mutation closure.
+impl SessionReap for Arc<Shared> {
+    fn reap_commit(&mut self, _sync_dir: &Path, sids: &[String]) -> Result<Vec<String>> {
+        let mut removed = Vec::new();
+        self.commit_state(|st| {
+            for sid in sids {
+                // Stale-snapshot guard, same discipline as the tombstone
+                // and backfill arms: the verdict's snapshot predates this
+                // lock acquisition, and traffic landing mid-pass is the
+                // resurrection channel working as designed — never delete
+                // a record that stopped being a zombie.
+                if st.sessions.get(sid).is_some_and(reapable) {
+                    st.sessions.remove(sid);
+                    removed.push(sid.clone());
+                }
+            }
+        })?;
+        // Every commit signals its sids (engine/mod.rs): a waiter parked
+        // on a reaped zombie sees its `pullPending` debt disappear with
+        // the record — waking it is exactly as true here as for any
+        // mutation commit, and the watch cache costs nothing when nobody
+        // listens.
+        for sid in &removed {
+            self.notify.signal(sid);
+        }
+        Ok(removed)
+    }
+}
+
+/// Test seam: same logic against the bare table.
+#[cfg(test)]
+impl SessionReap for State {
+    fn reap_commit(&mut self, sync_dir: &Path, sids: &[String]) -> Result<Vec<String>> {
+        let mut removed = Vec::new();
+        for sid in sids {
+            if self.sessions.get(sid).is_some_and(reapable) {
+                self.sessions.remove(sid);
+                removed.push(sid.clone());
+            }
+        }
+        state::commit(sync_dir, self)?;
+        Ok(removed)
+    }
+}
+
 /// Work a verdict produced for the pool. Reconcile itself never talks to B
 /// beyond the probe: pulls and publishes are queued here and executed by
 /// the worker layer under its retry/budget rules.
@@ -117,6 +208,12 @@ pub struct ReconcileReport {
     pub work: Vec<Work>,
     /// sids whose records were committed to `state.json` this pass.
     pub committed: Vec<String>,
+    /// sids row 27 reaped this pass — records DELETED wholesale in one
+    /// batch commit at pass end (not tombstoned, never resurrected as
+    /// rows: traffic or a fresh register rebuilds the shape from
+    /// scratch). Distinct from `committed`: nothing was mutated, the
+    /// entries are gone.
+    pub reaped: Vec<String>,
     /// Non-fatal notes worth a log line (length-truncate, re-deleted files,
     /// suspensions).
     pub notes: Vec<String>,
@@ -191,13 +288,15 @@ pub fn session_file(mirror: &Path, sid: &str) -> Option<PathBuf> {
 
 /// Run one reconciliation pass. `store` supplies the record table and
 /// takes one commit per mutation — no cross-session batching: the crash
-/// window must never widen beyond the record being settled.
+/// window must never widen beyond the record being settled. The single
+/// licensed exception is row 27's reap batch: pure record deletion with
+/// no execution surface, committed once at pass end (RFC-0002 §6.3).
 ///
 /// `b_probe` answers "does B still hold this session" per sid; verdicts
 /// that need it and get `BProbe::Unknown` skip the round (§6 preamble) —
 /// this function never guesses. `previously_suspended` lets the caller
 /// (the pool's runtime overlay) report which sids recovered.
-pub fn run<S: SessionStore>(
+pub fn run<S: SessionReap>(
     mirror: &Path,
     sync_dir: &Path,
     store: &mut S,
@@ -206,6 +305,12 @@ pub fn run<S: SessionStore>(
     previously_suspended: &dyn Fn(&str) -> bool,
 ) -> Result<ReconcileReport> {
     let mut report = ReconcileReport::default();
+    // Row 27's batch set: reap verdicts are collected through the pass
+    // and committed ONCE at pass end — one commit for the whole pass's
+    // zombies, not one per sid (the batching licence: no execution
+    // surface, so a crash mid-pass leaves survivors classifying
+    // identically next round).
+    let mut reap_sids: Vec<String> = Vec::new();
     // The session set is mirror ∪ records: E7's appearance edge supplies
     // sids the record table has never seen; disappearance is covered by
     // records whose file is gone.
@@ -414,14 +519,27 @@ pub fn run<S: SessionStore>(
                     report.committed.push(sid.clone());
                 }
             }
+            Action::Reap => {
+                // Row 27: collect only — the deletions land in ONE batch
+                // commit after the pass (see `reap_sids`). No per-sid
+                // work of any kind: the record carries nothing but the
+                // zombie intent, there is no file to touch and nothing
+                // to re-queue — re-queuing its pull would resurrect the
+                // zombie the verdict just condemned, which is exactly
+                // the traffic-driven resurrection channel and must only
+                // ever be driven by actual traffic.
+                reap_sids.push(sid.clone());
+            }
         }
         // `pullPending` presence is a pull task owed — report it so the
         // pool enqueues without journal involvement (the §9.1-7 replay
-        // path, T-634).
+        // path, T-634). A sid the pass just condemned to reap is
+        // excluded: its pending dies with the record.
         if store
             .get(&sid)
             .is_some_and(|r| r.pull_pending.is_some())
             && !report.suspended.contains(&sid)
+            && verdict.action != Action::Reap
         {
             report.work.push(Work::Pull {
                 sid: sid.clone(),
@@ -431,6 +549,25 @@ pub fn run<S: SessionStore>(
         if !report.suspended.contains(&sid) && previously_suspended(&sid) {
             report.unsuspended.push(sid.clone());
         }
+    }
+    // Row 27 batch commit: one transaction carries the whole pass's
+    // deletions. `reap_commit` re-validates each victim's zombie shape
+    // inside the commit lock — a record that attracted real fields
+    // mid-pass (traffic resurrection racing the pass) is spared rather
+    // than trusted away on a stale snapshot. Sids that survive the
+    // re-check simply classify again next pass; they are not errors.
+    if !reap_sids.is_empty() {
+        let removed = store.reap_commit(sync_dir, &reap_sids)?;
+        if !removed.is_empty() {
+            // The count is the operationally meaningful number (a boot
+            // pass on a zombie-infested mirror reaps thousands — joining
+            // them into one line is noise, not evidence); per-sid detail
+            // already lives in `report.verdicts`/`report.reaped`.
+            report
+                .notes
+                .push(format!("reaped {} zombie record(s)", removed.len()));
+        }
+        report.reaped = removed;
     }
     Ok(report)
 }
@@ -796,6 +933,11 @@ mod tests {
                 Ok(())
             }
         }
+        impl SessionReap for FakeStore {
+            fn reap_commit(&mut self, _: &Path, _: &[String]) -> Result<Vec<String>> {
+                Ok(Vec::new())
+            }
+        }
         let (mirror, sync) = setup("backfill");
         let mut store = FakeStore(["bonly".to_string()].into_iter().collect());
         let report = run(
@@ -921,6 +1063,471 @@ mod tests {
         // Stub shell under a full record → still None (sentinel ≠ content).
         let shell = FileProbe::from_bytes(b"{\"type\":\"zonepair-stub\"}\n");
         assert_eq!(tombstone_file_id(Some(&full), &shell), None);
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // -- row 27: the zombie reap execution seam ---------------------------
+
+    fn zombie_rec() -> SessionRecord {
+        SessionRecord {
+            pull_pending: Some(state::PullPending {
+                target: "latest".into(),
+                enqueued_at: "t".into(),
+                record: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn b_absent(_: &str) -> BProbe {
+        BProbe::Absent
+    }
+
+    /// A `SessionStore`/`SessionReap` double counting physical commits —
+    /// the batch-licence assertion's measuring instrument.
+    struct CountingStore {
+        state: State,
+        commits: usize,
+    }
+
+    impl CountingStore {
+        fn new(state: State) -> Self {
+            Self { state, commits: 0 }
+        }
+    }
+
+    impl SessionStore for CountingStore {
+        fn sids(&self) -> std::collections::BTreeSet<String> {
+            self.state.sessions.keys().cloned().collect()
+        }
+        fn get(&self, sid: &str) -> Option<SessionRecord> {
+            self.state.sessions.get(sid).cloned()
+        }
+        fn mutate_commit(
+            &mut self,
+            _: &Path,
+            sid: &str,
+            f: &mut dyn FnMut(&mut SessionRecord),
+        ) -> Result<()> {
+            f(self.state.sessions.entry(sid.to_string()).or_default());
+            self.commits += 1;
+            Ok(())
+        }
+    }
+
+    impl SessionReap for CountingStore {
+        fn reap_commit(&mut self, _: &Path, sids: &[String]) -> Result<Vec<String>> {
+            let mut removed = Vec::new();
+            for sid in sids {
+                if self.state.sessions.get(sid).is_some_and(reapable) {
+                    self.state.sessions.remove(sid);
+                    removed.push(sid.clone());
+                }
+            }
+            self.commits += 1;
+            Ok(removed)
+        }
+    }
+
+    // B-Absent + pullPending-only zombies: every one of them is deleted,
+    // and the whole pass pays exactly ONE commit — the batching licence
+    // is real, not one fsync per zombie.
+    #[test]
+    fn reap_deletes_zombies_in_one_batch_commit() {
+        let (mirror, sync) = setup("reapbatch");
+        let mut st = State::empty_v3();
+        for n in 1..=5 {
+            st.sessions.insert(format!("z{n}"), zombie_rec());
+        }
+        // A control: a real pull session sharing the pass — it must not
+        // be touched (and contributes no commit of its own: row 16/13
+        // steady rows commit nothing). No file on disk → row 17
+        // suspends, which also commits nothing.
+        st.sessions.insert(
+            "real".into(),
+            pull_rec("real", "zpc1.7.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        );
+        let mut store = CountingStore::new(st);
+        let report = run(
+            &mirror,
+            &sync,
+            &mut store,
+            PassKind::Steady,
+            &b_absent,
+            &never_suspended,
+        )
+        .unwrap();
+        for n in 1..=5 {
+            let sid = format!("z{n}");
+            assert!(
+                !store.state.sessions.contains_key(&sid),
+                "{sid} must be deleted, not tombstoned"
+            );
+            assert!(report.reaped.contains(&sid), "{sid} in report.reaped");
+        }
+        assert_eq!(
+            store.commits, 1,
+            "five zombies, one batch commit — not five"
+        );
+        assert!(store.state.sessions.contains_key("real"));
+        assert!(!report.reaped.contains(&"real".to_string()));
+        // Reaped sids owe no work of any kind: re-queuing their pull
+        // would resurrect the zombie the verdict just condemned.
+        for n in 1..=5 {
+            let sid = format!("z{n}");
+            assert!(
+                !report.work.iter().any(
+                    |w| matches!(w, Work::Pull { sid: s, .. } | Work::Publish { sid: s } if s == &sid)
+                ),
+                "{sid} must not be re-queued"
+            );
+        }
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // The hard boundary, regression-pinned: `registered` + pullPending
+    // is RFC-0003 §6.3's legitimate pre-state — B answering 404 must
+    // NEITHER consume the pending NOR reap the record; the verdict is
+    // row 20's Hold, the record survives untouched.
+    #[test]
+    fn registered_pending_is_never_reaped() {
+        let (mirror, sync) = setup("reapbound");
+        let mut st = State::empty_v3();
+        st.sessions.insert(
+            "legit".into(),
+            SessionRecord {
+                registered: Some(state::Registered {
+                    kind: "b-owned".into(),
+                    at: "t".into(),
+                }),
+                ..zombie_rec()
+            },
+        );
+        let mut store = CountingStore::new(st);
+        let report = run(
+            &mirror,
+            &sync,
+            &mut store,
+            PassKind::Steady,
+            &b_absent,
+            &never_suspended,
+        )
+        .unwrap();
+        assert!(store.state.sessions.contains_key("legit"));
+        assert!(store.state.sessions["legit"].pull_pending.is_some());
+        assert!(report.reaped.is_empty());
+        assert!(report
+            .verdicts
+            .iter()
+            .any(|(s, v)| s == "legit" && v.row == 20));
+        // …and because the record survives, its pending IS owed work —
+        // the requeue suppression applies to reaped sids only.
+        assert!(report.work.contains(&Work::Pull {
+            sid: "legit".into(),
+            force_reset: false
+        }));
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // BProbe::Unknown never reaps: the zombie survives unanswered rounds
+    // indefinitely, and its pending keeps re-queuing — reap is only ever
+    // the consequence of B positively answering 404.
+    #[test]
+    fn unknown_probe_skips_reap_round() {
+        let (mirror, sync) = setup("reapunk");
+        let mut st = State::empty_v3();
+        st.sessions.insert("z".into(), zombie_rec());
+        let mut store = CountingStore::new(st);
+        let report = run(
+            &mirror,
+            &sync,
+            &mut store,
+            PassKind::Steady,
+            &b_unknown,
+            &never_suspended,
+        )
+        .unwrap();
+        assert!(store.state.sessions.contains_key("z"));
+        assert!(report.reaped.is_empty());
+        assert_eq!(store.commits, 0, "no verdict, no commit");
+        assert!(report.work.contains(&Work::Pull {
+            sid: "z".into(),
+            force_reset: false
+        }));
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // The mid-pass resurrection guard: a record that picked up real
+    // fields between verdict and batch commit is NOT a zombie anymore —
+    // `reap_commit`'s in-lock re-validation must spare it. Drives the
+    // State seam directly (the race itself cannot be scripted into one
+    // synchronous pass).
+    #[test]
+    fn reap_commit_spares_resurrected_records() {
+        let (mirror, sync) = setup("reapguard");
+        let mut st = State::empty_v3();
+        st.sessions.insert("z".into(), zombie_rec());
+        // "Traffic lands mid-pass": a register intent fills the slot.
+        st.sessions.get_mut("z").unwrap().registered = Some(state::Registered {
+            kind: "b-owned".into(),
+            at: "t".into(),
+        });
+        let removed = st.reap_commit(&sync, &["z".to_string()]).unwrap();
+        assert!(removed.is_empty(), "resurrected record must be spared");
+        assert!(st.sessions.contains_key("z"));
+        // …while a still-zombie victim in the same batch dies normally.
+        st.sessions.insert("z2".into(), zombie_rec());
+        let removed = st
+            .reap_commit(&sync, &["z".to_string(), "z2".to_string()])
+            .unwrap();
+        assert_eq!(removed, vec!["z2".to_string()]);
+        assert!(st.sessions.contains_key("z"));
+        assert!(!st.sessions.contains_key("z2"));
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // `sync --wait`'s debt judgment across the reap boundary: the zombie
+    // blocks settle while it lives (its `pullPending` is in debt), and
+    // the reaped sid is simply absent — nothing counts it anymore. This
+    // is the RFC amendment's explicit wait note made executable.
+    #[test]
+    fn reaped_sid_counts_as_no_debt_for_sync_wait() {
+        let mut st = State::empty_v3();
+        st.sessions.insert("z".into(), zombie_rec());
+        assert!(
+            !crate::sync::state_machine::sync_settled(&st, true),
+            "a living zombie's pullPending is in debt"
+        );
+        let (mirror, sync) = setup("reapwait");
+        st.reap_commit(&sync, &["z".to_string()]).unwrap();
+        assert!(
+            crate::sync::state_machine::sync_settled(&st, true),
+            "after reap the sid is gone — structurally no debt"
+        );
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // -- resurrection channels (spec §3.2's honest semantics, end to end) --
+
+    // Channel 1 — traffic resurrection: a reaped sid whose session sees
+    // traffic again rebuilds through the ordinary pull path, back to
+    // exactly the pre-reap shape and beyond. Drive: reap the zombie through
+    // a REAL pass on the production store (`Arc<Shared>` — exercises the
+    // funnel implementation, not just the test seam), feed a fresh pull
+    // intent through the journal read-in, then run the pull executor
+    // against a scripted B: the file lands and `pull` is built.
+    #[tokio::test]
+    async fn traffic_resurrection_rebuilds_after_reap() {
+        use crate::sync::engine::pool::TaskOutcome;
+        use crate::sync::engine::testkit::{
+            ctx_with, finish_server, http_json, http_octets, serve_script,
+            setup as shared_setup, Scripted,
+        };
+        use crate::sync::persist::journal::{self, Intent};
+        use serde_json::json;
+
+        // B answers the zero-cursor first pull with a `reset` carrying
+        // one line (8 bytes — the cursor attests exactly that), then
+        // `unchanged` — which must arrive as JSON: octet-stream cannot
+        // carry a body-free verdict (RFC-0001 §6.2).
+        let cursor1 = "zpc1.8.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let script = vec![
+            vec![Scripted::Reply(http_octets("reset", cursor1, b"{\"a\":1}\n"))],
+            vec![Scripted::Reply(http_json(
+                200,
+                &json!({"ok": true, "state": "unchanged", "nextCursor": cursor1}).to_string(),
+            ))],
+        ];
+        let (base, seen, server) = serve_script(script).await;
+        let (mirror, shared) = shared_setup("reap-traffic");
+        let sid = "zs";
+
+        // Seed the zombie directly, then prove the production reap seam
+        // (Arc<Shared> → commit_state funnel) deletes it.
+        shared
+            .commit_state(|st| {
+                st.sessions.insert(sid.into(), zombie_rec());
+            })
+            .unwrap();
+        let mut store = shared.clone();
+        let report = run(
+            &shared.mirror,
+            &shared.sync_dir,
+            &mut store,
+            PassKind::Steady,
+            &b_absent,
+            &never_suspended,
+        )
+        .unwrap();
+        assert_eq!(report.reaped, vec![sid.to_string()]);
+        assert!(shared.with_state(|st| !st.sessions.contains_key(sid)));
+
+        // Traffic: a new pull intent arrives and is consumed through the
+        // real journal path — the record resurrects as the exact
+        // pre-reap shape (pullPending-only).
+        journal::append(
+            &shared.journal_dir,
+            &Intent::Pull {
+                sid: sid.into(),
+                target: "latest".into(),
+                enqueued_at: "t".into(),
+            },
+        )
+        .unwrap();
+        let mut st = State::empty_v3();
+        let consumed = journal::consume_ordered(
+            &shared.journal_dir,
+            &shared.sync_dir,
+            &mut st,
+            |_: &State, _| None,
+        )
+        .unwrap();
+        assert_eq!(consumed.len(), 1);
+        assert!(st.sessions[sid].pull_pending.is_some());
+        assert!(st.sessions[sid].pull.is_none());
+        // Land the consumed table into Shared the way the pool's drain
+        // does, then let the executor run.
+        shared
+            .commit_state(|dst| {
+                dst.sessions.insert(sid.into(), st.sessions[sid].clone());
+            })
+            .unwrap();
+
+        let ctx = ctx_with(&base, &shared);
+        let outcome = crate::sync::engine::pull::run_pull(&ctx, sid, false).await;
+        assert!(
+            matches!(outcome, TaskOutcome::Done),
+            "resurrected pull must run to done: {outcome:?}"
+        );
+        shared.with_state(|st| {
+            let rec = &st.sessions[sid];
+            assert!(rec.pull.is_some(), "pull evidence rebuilt from zero cursor");
+            assert!(rec.pull_pending.is_none(), "latest satisfied by unchanged");
+        });
+        assert!(
+            mirror.join("projects/lab/zs.jsonl").is_file(),
+            "the file is pulled to disk — strictly stronger than the zombie shape"
+        );
+        finish_server(server, &seen).await;
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // Channel 2 — register resurrection: a `--session-id` reusing the
+    // reaped sid lands `registered` (the apply fills blank slots, needing
+    // no prior fields), and the next pass hits row 21 — RFC's first-pull
+    // path takes over exactly as if the reap never happened.
+    #[test]
+    fn register_resurrection_hits_first_pull_row21() {
+        use crate::sync::engine::testkit::setup as shared_setup;
+        use crate::sync::persist::journal::{self, Intent};
+
+        let (mirror, shared) = shared_setup("reap-reg");
+        let sid = "zr";
+        shared
+            .commit_state(|st| {
+                st.sessions.insert(sid.into(), zombie_rec());
+            })
+            .unwrap();
+        let mut store = shared.clone();
+        let report = run(
+            &shared.mirror,
+            &shared.sync_dir,
+            &mut store,
+            PassKind::Steady,
+            &b_absent,
+            &never_suspended,
+        )
+        .unwrap();
+        assert_eq!(report.reaped, vec![sid.to_string()]);
+
+        journal::append(
+            &shared.journal_dir,
+            &Intent::Register {
+                sid: sid.into(),
+                enqueued_at: "t".into(),
+            },
+        )
+        .unwrap();
+        let mut st = State::empty_v3();
+        journal::consume_ordered(&shared.journal_dir, &shared.sync_dir, &mut st, |_: &State, _| None)
+            .unwrap();
+        assert!(
+            st.sessions[sid].registered.is_some(),
+            "register fills the blank record — no pullPending needed"
+        );
+        shared
+            .commit_state(|dst| {
+                dst.sessions.insert(sid.into(), st.sessions[sid].clone());
+            })
+            .unwrap();
+
+        // B now has data: row 21 fires — FirstPull work, strictly the
+        // RFC first-pull channel.
+        let mut store = shared.clone();
+        let report = run(
+            &shared.mirror,
+            &shared.sync_dir,
+            &mut store,
+            PassKind::Steady,
+            &|_: &str| BProbe::Present,
+            &never_suspended,
+        )
+        .unwrap();
+        assert!(report
+            .verdicts
+            .iter()
+            .any(|(s, v)| s == sid && v.row == 21));
+        assert!(report.work.contains(&Work::Pull {
+            sid: sid.into(),
+            force_reset: true
+        }));
+        assert!(report.reaped.is_empty());
+        std::fs::remove_dir_all(&mirror).unwrap();
+    }
+
+    // The dead-shape pin (spec §3.2.2's honest declaration, made
+    // executable): after reap, B flipping to Present WITHOUT any traffic
+    // does NOT resurrect anything locally — the sid enters neither the
+    // scan set nor the record table, so row 23's backfill cannot fire
+    // for it. A-side has no B-enumeration channel; that is the declared
+    // semantic, and this test exists to stop anyone from believing an
+    // automatic discovery path exists.
+    #[test]
+    fn dead_shape_has_no_automatic_recovery() {
+        let (mirror, sync) = setup("reap-dead");
+        let mut st = State::empty_v3();
+        st.sessions.insert("zd".into(), zombie_rec());
+        let report = run(
+            &mirror,
+            &sync,
+            &mut st,
+            PassKind::Steady,
+            &b_absent,
+            &never_suspended,
+        )
+        .unwrap();
+        assert_eq!(report.reaped, vec!["zd".to_string()]);
+
+        // B now produces the session out-of-band; no traffic passes
+        // through A. Run the pass with B Present:
+        let report = run(
+            &mirror,
+            &sync,
+            &mut st,
+            PassKind::Steady,
+            &|_: &str| BProbe::Present,
+            &never_suspended,
+        )
+        .unwrap();
+        assert!(
+            !st.sessions.contains_key("zd"),
+            "no record resurrects — A never learns the sid exists"
+        );
+        assert!(
+            !report.verdicts.iter().any(|(s, _)| s == "zd"),
+            "the sid is not even scanned — row 23 cannot reach it"
+        );
+        assert!(report.work.is_empty());
         std::fs::remove_dir_all(&mirror).unwrap();
     }
 }

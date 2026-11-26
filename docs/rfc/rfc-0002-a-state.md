@@ -178,7 +178,8 @@ After tombstone filtering, what state a session is in is uniquely determined by 
 ```text
 { file present?, pull?, task?, publishedAt?, registered?, materialized? }  +  { file present on B? }
 + content probes: file fingerprint (tombstone fileId comparison), forkedFrom marker, stub-shell structural recognition
-(pullPending does not participate in classification)
+(pullPending never constitutes ownership or progress evidence; the single exception is row 27, the zombie reap,
+whose trigger is precisely that pullPending is the ONLY field present — §6.3)
 ```
 
 "Field combination is classification" must be honest up to here: most rows look only at fields, but three — tombstone hit, resume-fork judgment, stub-shell recognition — must read file content; classification is not a pure record judgment. **When B probing fails (B unreachable), every row depending on `file present on B?` is not judged and no action is taken this round** — rather miss one round than treat "B did not answer" as "B does not have".
@@ -187,7 +188,7 @@ After tombstone filtering, what state a session is in is uniquely determined by 
 
 ### 6.1 Complete classification table
 
-**Matching rule: first row hit in table order.** Rows with more specific conditions and disposition rows (degraded, tombstone, suspended) precede normal-state rows — when one record hits multiple rows, the first hit takes over and later rows are not evaluated.
+**Matching rule: first row hit in table order.** Rows with more specific conditions and disposition rows (degraded, tombstone, suspended) precede normal-state rows — when one record hits multiple rows, the first hit takes over and later rows are not evaluated. Row 27, added by amendment, is numbered out of sequence: its evaluation position is between rows 22 and 23 (more specific than the "no record" rows), and its table row is placed at that position below.
 
 | # | Field combination | Classification | Handling |
 |---|---|---|---|
@@ -213,6 +214,7 @@ After tombstone filtering, what state a session is in is uniquely determined by 
 | 20 | `registered ∧ no pull ∧ B 404 ∧ file absent` | File not yet produced on B | No suspension: the normal pre-state of registered-not-yet-produced, waits for B to write |
 | 21 | `registered ∧ no pull ∧ B has data ∧ file absent` | B-side awaiting first pull | First pull builds `pull` (`projects/lab/` convention) |
 | 22 | File present ∧ contains `forkedFrom` marker ∧ no pull/task/registered/publishedAt | Candidate A-managed | Register `task(writing)`, **do not publish** |
+| 27 | `pullPending` is the only field (no pull/task/publishedAt/deleted/registered/materialized/lastUnchangedAt) ∧ file absent ∧ B 404 | Zombie intent record — a pull intent landed on a session that never registered and never produced bytes; §6.3 | **Reap**: delete the entire record — never a tombstone (semantics in §6.3). `registered` present is the hard boundary: a registered pending is the legitimate pre-state and is NEVER reapable. When B cannot answer, skip the round — reap never acts on a guess. The whole pass's reaps may share one commit: the verdict has no execution surface beyond the deletion itself |
 | 23 | No record ∧ B has session | B-side backfill | Backfill `registered` (after §5 tombstone filtering) |
 | 24 | No record ∧ file present ∧ B 404 | Manually inserted non-fork file | Orphan: register `writing` + permanently suspended (same origin as §4.2 orphan handling) |
 | 25 | Non-pull record shows `materialized≠full` | Field corruption | Suspend: `materialized` is meaningful only for pull sessions (§3.3); appearing in other record shapes can only mean it was written broken |
@@ -244,6 +246,20 @@ file contains forkedFrom marker ∧ no pull ∧ no publishedAt ∧ tombstone not
 The negations must be pinned down: `no pull` = the record has no `pull` field (`pullPending` does not constitute "already pulled" evidence); `tombstone not hit` = `deleted` absent **or** `fileId` does not match the current file fingerprint (§5's instance semantics).
 
 **Contrast example**: `--resume s2` and `s2.jsonl` carries `forkedFrom`. If s2 has no `pull`, no `publishedAt`, tombstone not hit → resume fork product; the wait blocks until confirmation. If s2 already has `pull` (last fork was published) → normal resume, released immediately. **Same file, same marker; the judgment is decided entirely by persistent state** — the argv parameters themselves cannot distinguish the two kinds of resume; this is exactly why the judgment exists.
+
+### 6.3 The zombie reap: deleting intent-only records
+
+A pull intent can land on a session that never registered and never produces bytes (the intent protocol deliberately does not gate `pull` on registration — journaling is fire-and-forget). If B never persists that session, the record sits as `pullPending`-only forever: rows 19–21 all require `registered`, rows 23/24/26's "no record" shapes cannot match a record that carries a field, so without row 27 the table has literally nothing to say — a semantic blank, filled de facto by the wait-a-round fallback. Row 27 closes that blank.
+
+Three decisions are pinned, and each is stated with its reason because the wrong neighbor is tempting:
+
+**Deletion, not a tombstone.** A tombstone on such a record would carry `fileId: null` (there is no file to fingerprint) — and `fileId: null` is the permanent seal of §5: the sid could never carry a file again, and even a fresh pull intent is dropped at read-in. Sealing a sid whose only crime is "a pull intent arrived for a session B never persisted" is wildly disproportionate and irreversible; deletion is neither. A record carrying `registered` is the hard boundary and is NEVER reapable — the registered-not-yet-produced pre-state is legitimate waiting, protected by RFC 0003 §6.3's "404 does not consume `pullPending`".
+
+**Resurrection is traffic-driven, and the existing channels cover it completely.** Two channels, both already in the protocol: (i) fresh traffic — the session is used again, a new `pull` intent lands `pullPending` exactly as before the reap, and the pull executor rebuilds from the zero cursor: if B has bytes they are pulled, if not the intent is conserved — bit-for-bit the pre-reap shape, nothing lost; (ii) a fresh `--session-id` registration — `registered` lands on the blank record and rows 19–21's first-pull path takes over, ending strictly stronger than the zombie shape. The joint coverage is exact: for any session that ever interacts with A again, reap is fully reversible; for a session that never interacts again, reap and survival are observationally identical.
+
+**The dead shape is a declared blank, not a feature.** If B produces the session entirely out-of-band and no traffic ever passes through A, nothing locally discovers it — before the reap amendment just as after it. A has no B-side enumeration capability by design; the zombie's periodic pull polling happened to approximate discovery for this shape, but paying a permanent polling tax on every dead intent to cover a case outside the model is not a feature, it is an accident. Row 27 removes the accident, not an obligation. If multi-machine or out-of-band discovery ever becomes a requirement, it is an independent new mechanism (B-side session enumeration), explicitly outside reap semantics.
+
+`sync --wait`'s view of a reaped sid is stated in §9.
 
 ## 7. Crash consistency
 
@@ -285,6 +301,8 @@ Why not "read-only refusal": pull progress has a safe rebuild path; a blanket re
 The condition for manual draining is a **pure structural judgment, no clock**: journal directory empty ∧ no `pullPending` ∧ all `task`s reached terminal state, absent, or are spawn-evidence-less suspended `writing` (orphans, §4.2 — they never reach terminal but are also not "work still to do"). The companion clearing rule therefore becomes part of the contract: **`pullPending` is deleted in the same transaction when the pull is satisfied (reaching target or `changes` returning `unchanged`)** — intent fulfilled is intent consumed; no observation residue is kept for it; clock fields `enqueuedAt`/`lastUnchangedAt` return to pure observation positions and no longer serve as judgment basis (the clock clause of §3.3 thus truly holds on the judgment surface: clock rollback only makes wait wait longer, it cannot make it lie; in the old scheme clock jumps could report complete before draining).
 
 Sessions without `pull` do not count as "in debt" — they may be registered sessions with no data yet or trimmed unloaded ones; `wait` does not wait for them.
+
+**Reaped sessions count as no debt, explicitly.** A zombie record reaped per row 27 (§6.3) disappears wholesale — its `pullPending` is gone, so the structural judgment no longer sees it as debt. This is the correct semantics, not a bookkeeping artifact: waiting on a session B never persists can never converge, and reap turns that permanent hang into "no debt", exactly matching the spirit of the paragraph above — a pull-absent session is not waited on. The reap does not lie to the waiter in the other direction either: if the session sees traffic again, the fresh pull intent re-lands `pullPending` and the debt re-appears on the structural judgment until satisfied.
 
 ## 10. Design boundaries
 

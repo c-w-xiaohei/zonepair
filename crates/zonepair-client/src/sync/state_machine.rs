@@ -5,9 +5,10 @@
 //! {B file?}`.
 //!
 //! Fixed rule order: the tombstone filter ALWAYS runs first (§5) — a
-//! `fileId` instance hit suppresses everything; then the 26-row joint
+//! `fileId` instance hit suppresses everything; then the 27-row joint
 //! decision table of §6.1, first match wins (more specific rows ahead of
-//! steady rows, exactly as the RFC numbers them). Rows that depend on
+//! steady rows — row 27, the zombie reap, therefore evaluates between
+//! rows 22 and 23 exactly as the RFC positions it). Rows that depend on
 //! `file present on B?` evaluate only when the probe answered — an unreachable B
 //! is "this round is indeterminate" for those rows, never "B has nothing".
 //!
@@ -138,6 +139,16 @@ pub enum Action {
     /// No record + B has the session: backfill `registered` (after the
     /// tombstone filter, which already ran).
     BackfillRegistered,
+    /// Row 27 — a zombie intent record: `pullPending` is the only field,
+    /// there is no local file, and B answers 404. The whole session record
+    /// is deleted — NOT tombstoned: a tombstone with `fileId:null` would
+    /// seal the sid permanently (§5), while deletion keeps both traffic
+    /// resurrection channels open (a fresh pull intent rebuilds the exact
+    /// pre-reap shape; a fresh register intent lands `registered` and the
+    /// first-pull rows take over). Execution is the executor's batch arm —
+    /// reap has no execution surface (nothing touches files or B), so one
+    /// commit may carry the whole pass's deletions.
+    Reap,
 }
 
 /// Why a row suspended — reported to workers and `ensure_published`.
@@ -219,6 +230,33 @@ impl<'a> Ctx<'a> {
             && r.registered.is_none()
             && r.materialized.is_none()
     }
+    /// Row 27's zombie shape: `pullPending` and NOTHING else. Two checks
+    /// read wider than their RFC field list, deliberately:
+    ///
+    /// - `materialized` must be ABSENT entirely, not merely `full`-
+    ///   equivalent. Absence equals `full` for the materialization rows,
+    ///   but here an *explicit* `Some(_)` — even `Some(Full)` — is
+    ///   evidence the record once belonged to a real materialized session
+    ///   (the evict/hydrate write sequence is its only writer), which is
+    ///   never the zombie shape. Conservative: exempt, reap it never.
+    /// - `last_unchanged_at` must be absent too: it is written only by a
+    ///   pull that observed `unchanged`, so its presence means the
+    ///   session once pulled real bytes — again never the zombie shape.
+    ///
+    /// Both widenings only ever *shrink* the reap set; a record they
+    /// exempt falls through to the wait-a-round verdict exactly as
+    /// before row 27 existed.
+    fn zombie_intent(&self) -> bool {
+        let r = self.r();
+        r.pull_pending.is_some()
+            && r.pull.is_none()
+            && r.task.is_none()
+            && r.published_at.is_none()
+            && r.deleted.is_none()
+            && r.registered.is_none()
+            && r.materialized.is_none()
+            && r.last_unchanged_at.is_none()
+    }
     fn needs_b(&self) -> bool {
         self.b == BProbe::Unknown
     }
@@ -246,8 +284,10 @@ struct Row {
     act: fn(&Ctx) -> Action,
 }
 
-/// The 26 rows in RFC order — read alongside `docs/rfc/rfc-0002-a-state.md`
-/// §6.1; every `n` is that table's row number.
+/// The 27 rows in RFC order — read alongside `docs/rfc/rfc-0002-a-state.md`
+/// §6.1; every `n` is that table's row number, and the array position is
+/// the evaluation order (row 27 slots between rows 22 and 23 per the RFC's
+/// first-match placement rule).
 static ROWS: &[Row] = &[
     // 1 — degraded terminal: never auto-reset (§4.1: no out-edges).
     Row {
@@ -490,6 +530,25 @@ static ROWS: &[Row] = &[
         },
         act: |_| Action::WritingHold { orphan: false },
     },
+    // 27 — pullPending-only zombie ∧ no file ∧ B 404: reap the whole
+    // record. Positioned AFTER row 22 and BEFORE the "no record" rows
+    // 23/24 (first-match order: the more specific row leads) — a zombie
+    // can never reach 23 (`rec` is present) or 24 (`pullPending` is a
+    // field), and rows 1–22 all demand a field or file the zombie lacks,
+    // so this is the first row the shape can hit. The `registered`
+    // absence inside the predicate is the hard boundary: a registered
+    // pending is RFC-0003 §6.3's legitimate pre-state (404 must not
+    // consume `pullPending`) and is NEVER reapable. needs_b: `BProbe::Unknown`
+    // skips the round rather than reaping on a guess — reap is the one
+    // verdict whose execution erases the record itself.
+    Row {
+        n: 27,
+        needs_b: true,
+        test: |c| {
+            c.zombie_intent() && !c.file.exists && c.b == BProbe::Absent
+        },
+        act: |_| Action::Reap,
+    },
     // 23 — no record ∧ B has the session: B-side backfill `registered`
     // (tombstone already ran — a sealed sid never reaches here).
     Row {
@@ -563,8 +622,10 @@ pub fn classify(
         }
     }
     // The table is not meant to be left un-hit; a record carrying only
-    // `pullPending` (or a hand-dropped file with B still silent) lands
-    // here — wait a round rather than suspend a legitimate state.
+    // `pullPending` while B has not yet answered 404 (or a hand-dropped
+    // file with B still silent) lands here — wait a round rather than
+    // suspend a legitimate state. Row 27 reaps the zombie only once B
+    // positively answers Absent.
     Verdict {
         row: u8::MAX,
         action: Action::Hold,
@@ -1050,6 +1111,123 @@ mod tests {
             (v.row, v.action),
             (26, Action::Suspend(SuspendReason::ManualDecision))
         );
+    }
+
+    // -- row 27: the zombie reap (T-496/T-497) ------------------------------
+
+    fn zombie() -> SessionRecord {
+        SessionRecord {
+            pull_pending: Some(super::super::persist::state::PullPending {
+                target: "latest".into(),
+                enqueued_at: "t".into(),
+                record: None,
+            }),
+            ..rec()
+        }
+    }
+
+    // T-496: the hit matrix — pullPending-only ∧ no file ∧ B 404 reaps.
+    #[test]
+    fn t496_row27_zombie_reaps_on_b_absent() {
+        let v = classify(Some(&zombie()), &FileProbe::absent(), BProbe::Absent);
+        assert_eq!((v.row, v.action), (27, Action::Reap));
+    }
+
+    // T-497: the miss matrix — every single predicate conjunct is
+    // necessary; flipping exactly one must move the verdict OFF row 27.
+    #[test]
+    fn t497_row27_miss_matrix() {
+        let no_b = FileProbe::absent();
+        // (1) `registered` present — the hard boundary: a registered
+        // pending is RFC-0003 §6.3's legitimate pre-state and NEVER
+        // reaps. With B 404 it lands on row 20 (registered, not yet
+        // produced).
+        let mut r = zombie();
+        r.registered = Some(super::super::persist::state::Registered {
+            kind: "b-owned".into(),
+            at: "t".into(),
+        });
+        assert_eq!(
+            classify(Some(&r), &no_b, BProbe::Absent).row,
+            20,
+            "registered + pullPending is the legitimate pre-state, never reap"
+        );
+        // (2) `pull` present — a real pull channel exists (row 13/17
+        // depending on materialization, never row 27).
+        let mut r = zombie();
+        with_pull(&mut r);
+        assert_ne!(classify(Some(&r), &no_b, BProbe::Absent).row, 27);
+        // (3) `task` present.
+        let mut r = zombie();
+        r.task = task(Phase::Writing).task;
+        assert_ne!(classify(Some(&r), &no_b, BProbe::Absent).row, 27);
+        // (4) `publishedAt` present.
+        let mut r = zombie();
+        r.published_at = Some("t".into());
+        assert_ne!(classify(Some(&r), &no_b, BProbe::Absent).row, 27);
+        // (5) `materialized` explicitly present — even `Some(Full)`:
+        // only the evict/hydrate write sequence ever writes the field,
+        // so the record once belonged to a real materialized session and
+        // is never the zombie shape.
+        for mat in [
+            Materialized::Full,
+            Materialized::Stub,
+            Materialized::Unloaded,
+        ] {
+            let mut r = zombie();
+            r.materialized = Some(mat);
+            assert_ne!(
+                classify(Some(&r), &no_b, BProbe::Absent).row,
+                27,
+                "explicit materialized={mat:?} exempts the record from reap"
+            );
+        }
+        // (6) `lastUnchangedAt` present — proof the session once pulled
+        // real bytes; not the zombie shape.
+        let mut r = zombie();
+        r.last_unchanged_at = Some("t".into());
+        assert_ne!(classify(Some(&r), &no_b, BProbe::Absent).row, 27);
+        // (7) file exists — absence is a conjunct; a present file must
+        // never be orphaned by deleting its record.
+        assert_ne!(
+            classify(Some(&zombie()), &file(b"a\n"), BProbe::Absent).row,
+            27
+        );
+        // (8) B Present — the session exists on B; reaping would drop a
+        // live pull goal.
+        assert_ne!(
+            classify(Some(&zombie()), &no_b, BProbe::Present).row,
+            27
+        );
+        // (9) B Unknown — the row is skipped entirely (needs_b); the
+        // zombie falls through to the conservative wait-a-round verdict
+        // rather than being reaped on a guess.
+        let v = classify(Some(&zombie()), &no_b, BProbe::Unknown);
+        assert_eq!((v.row, v.action), (u8::MAX, Action::Hold));
+    }
+
+    // Row 27's placement: first-match order must not let the "no record"
+    // rows 23/24 or the catch-alls 25/26 shadow it — and a zombie with a
+    // tombstone never reaches it (the filter runs first, always).
+    #[test]
+    fn row27_placement_and_tombstone_precedence() {
+        // A present-key record holding ONLY pullPending: rows 23/24/26
+        // cannot match (23 needs `no record`, 24/26 need no fields at
+        // all) — row 27 is genuinely the first hit, not a shadow victim.
+        assert_eq!(
+            classify(Some(&zombie()), &FileProbe::absent(), BProbe::Absent).row,
+            27
+        );
+        // Tombstone + pullPending residue (a shape the bury transaction
+        // never produces, but hand-edits might): the sealed filter hits
+        // before the table, reap never fires on a buried record.
+        let mut r = zombie();
+        r.bury("t", None);
+        assert!(r.pull_pending.is_none(), "bury clears pullPending");
+        // Reconstruct the corrupt hybrid by hand:
+        r.pull_pending = zombie().pull_pending;
+        let v = classify(Some(&r), &FileProbe::absent(), BProbe::Absent);
+        assert_eq!((v.row, v.action), (0, Action::SuppressAndDelete));
     }
 
     // T-477: unreachable B never acts — B-dependent rows skip, and a
